@@ -106,7 +106,3 @@ Once the system is running, the Serial Monitor will display the initialization s
 | **RAM Usage** | \~22.8 KB | Tensor Arena + Audio Buffers |
 | **Inference Time** | \~35 ms | Per window |
 
-
------
-
-*This project is part of a scientific research report on Embedded Systems and TinyML.*
