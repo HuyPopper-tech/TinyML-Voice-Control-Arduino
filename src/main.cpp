@@ -1,376 +1,311 @@
-/*
- ** NOTE: If you run into TFLite arena allocation issue.
- ** Try defining "-DEI_CLASSIFIER_ALLOCATION_STATIC" in boards.local.txt
- */
+/* Voice-controlled IoT system using Edge Impulse speech recognition */
+/* Supports wake word detection and command execution for LED and FAN control */
 
-/* Includes ---------------------------------------------------------------- */
-#include <PDM.h>
 #include <Arduino.h>
-#include <Speech_Recognition_inferencing.h>
-#include <vector>
-#include <string>
-#include <cmath>
+#include <PDM.h>  /* Pulse Density Modulation microphone library */
+#include <Speech_Recognition_inferencing.h>  /* Edge Impulse inference library */
 
-/* Memory optimization macro */
-// If your target is limited in memory remove this macro to save 10K RAM
-#define EIDSP_QUANTIZE_FILTERBANK 1
+#include <deque>  /* For command history queue */
+#include <string>  /* For string operations */
+#include <vector>  /* For detection results */
 
-/* Audio buffer settings */
-#define NUM_FRAMES                 3
-#define FRAME_SAMPLES              EI_CLASSIFIER_RAW_SAMPLE_COUNT
-#define TOTAL_SAMPLES              (NUM_FRAMES * FRAME_SAMPLES)
+/* Enable quantization for filterbank to optimize memory usage */
+#define EIDSP_QUANTIZE_FILTERBANK    1
 
-/* Hardware Pin Definitions */
-#define LEDR                       22
-#define LEDG                       23
-#define LEDB                       24
+/* Perform inference every 300ms for responsive detection */
+#define INFERENCE_EVERY_MS           300
+/* Minimum confidence threshold (70%) to accept a prediction */
+#define PREDICTION_THRESHOLD         0.7f
+/* Timeout period (5 seconds) - system returns to idle if no command received */
+#define LISTENING_TIMEOUT_MS         5000
 
-#define L298N_IN1                  8
-#define L298N_IN2                  9
-#define L298N_ENA                  10
+/* Circular buffer size matching the classifier's required sample count */
+#define RING_BUFFER_SIZE             (EI_CLASSIFIER_RAW_SAMPLE_COUNT)
 
-/* Sliding Window Configuration */
-#define WINDOW_STEP_MS             300    /* Step size for the sliding window (300ms stride) */
-#define PREDICTION_THRESHOLD       0.7f  /* Minimum confidence to accept a prediction */
+/* Hardware pin definitions */
+#define BUZZER_PIN                   D2  /* Buzzer for audio feedback */
+#define FAN_PIN                      D3  /* Fan control output */
 
-/** Audio buffers, pointers and selectors */
-typedef struct {
-    int16_t *buffer;
-    uint8_t buf_ready;
-    uint32_t buf_count;
-    uint32_t n_samples;
-} inference_t;
+/* Circular buffer for audio samples used by the classifier */
+static int16_t ring_buffer[RING_BUFFER_SIZE];
+/* Current write position in the ring buffer (volatile for ISR access) */
+static volatile int write_index = 0;
+/* Flag indicating if the buffer has wrapped around at least once */
+static volatile bool buffer_filled_once = false;
+/* Counter tracking samples collected since last inference */
+static int samples_since_last_inference = 0;
 
-/* Structure to hold detected keywords with timestamp */
-struct DetectedKeyword {
-    String label;
-    unsigned long timestamp; 
-    float confidence;
+/* Temporary buffer for PDM microphone data */
+static short sampleBuffer[2048];
+
+/* FSM States */
+enum SystemState {
+    STATE_IDLE,       /* Waiting for wake word */
+    STATE_LISTENING,  /* Active listening for commands */
 };
 
-/* Global variables */
-static inference_t inference;
-static signed short sampleBuffer[2048];   /* Temporary buffer for PDM callback */
-static bool debug_nn = false;             /* Set true to debug features */
-static int window_offset = 0;             /* Tracks current position in the sliding window */
+/* Current system state - starts in idle mode */
+SystemState current_state = STATE_IDLE;
+/* Timestamp of last wake word detection or command - used for timeout */
+unsigned long last_wake_time = 0;
 
-/* Function Prototypes */
+/* Structure to hold detected keyword information */
+struct DetectedKeyword {
+    String label;              /* Detected keyword label */
+    unsigned long timestamp;   /* Time of detection */
+    float confidence;          /* Confidence score (0.0 to 1.0) */
+};
+
+/* Structure to store command history for sequence analysis */
+struct CommandHistory {
+    String label;              /* Command label */
+    unsigned long timestamp;   /* Time of detection */
+};
+/* Queue storing recent commands (max 5) for pattern matching */
+std::deque<CommandHistory> active_history;
+
+/* FSM processing function - handles state transitions and command execution */
+void process_fsm(std::vector<DetectedKeyword> detections);
+/* Controls the RGB LED with specified colors (true = on, false = off) */
+void RGB_control(bool red, bool green, bool blue);
+/* Controls the fan motor (true = on, false = off) */
+void fan_control(bool on);
+/* ISR callback for PDM microphone - fills ring buffer with audio samples */
 static void pdm_data_ready_inference_callback(void);
-static bool microphone_inference_start(uint32_t n_samples);
-static bool microphone_inference_record(void);
-static void microphone_inference_end(void);
-void process_command(std::vector<DetectedKeyword> detections);
-void RGB_control(bool red, bool green, bool blue); 
-void motor_control(bool forward, bool backward, int speed);
 
-/**
- * @brief      Arduino setup function
- */
+/* System initialization - runs once at startup */
 void setup() {
-    Serial.begin(115200);
-    // while (!Serial); /* Optional: Wait for Serial Monitor */
-    
-    Serial.println("Edge Impulse Inferencing Demo");
+    /* Initialize serial communication at high baud rate for debugging */
+    Serial.begin(921600);
+    while (!Serial);  /* Wait for serial port to connect */
 
-    /* Configure LED pins */
-    pinMode(LED_BUILTIN, OUTPUT);
-    pinMode(LEDR, OUTPUT);
-    pinMode(LEDG, OUTPUT);
-    pinMode(LEDB, OUTPUT);
+    Serial.println("Edge Impulse Wake Word Demo (Continuous)");
 
-    pinMode(L298N_IN1, OUTPUT);
-    pinMode(L298N_IN2, OUTPUT);
-    pinMode(L298N_ENA, OUTPUT);
+    /* Configure all output pins */
+    pinMode(LED_BUILTIN, OUTPUT);  /* Built-in LED for user control */
+    pinMode(LEDR, OUTPUT);         /* Red LED for status indication */
+    pinMode(LEDG, OUTPUT);         /* Green LED for status indication */
+    pinMode(LEDB, OUTPUT);         /* Blue LED for status indication */
+    pinMode(BUZZER_PIN, OUTPUT);   /* Buzzer for audio feedback */
+    pinMode(FAN_PIN, OUTPUT);      /* Fan control output */
 
-    /* Print model settings */
+    /* Set initial state - Red LED indicates idle/sleeping state */
+    RGB_control(true, false, false);
+    digitalWrite(BUZZER_PIN, LOW);  /* Ensure buzzer is off */
+
+    /* Display classifier configuration for debugging */
     ei_printf("Inferencing settings:\n");
     ei_printf("\tInterval: %.2f ms.\n", (float)EI_CLASSIFIER_INTERVAL_MS);
     ei_printf("\tFrame size: %d\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
-    ei_printf("\tSample length: %d ms.\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT / 16);
-    ei_printf("\tNo. of classes: %d\n", sizeof(ei_classifier_inferencing_categories) / sizeof(ei_classifier_inferencing_categories[0]));
 
-    /* Initialize microphone buffer */
-    if (microphone_inference_start(TOTAL_SAMPLES) == false) {
-        ei_printf("ERR: Could not allocate audio buffer (size %d)\r\n", TOTAL_SAMPLES);
-        return;
+    /* Configure PDM microphone */
+    PDM.onReceive(&pdm_data_ready_inference_callback);  /* Set ISR callback */
+    PDM.setBufferSize(2048);  /* Set buffer size for audio samples */
+    if (!PDM.begin(1, EI_CLASSIFIER_FREQUENCY)) {  /* Start PDM with classifier frequency */
+        ei_printf("Failed to start PDM!");
+        while (1);  /* Halt execution on failure */
     }
-
-    RGB_control(false, false, false);
+    PDM.begin(1, 16000);  /* Mono channel, 16kHz sampling rate */
+    PDM.setGain(127);     /* Set microphone gain to maximum */
 }
 
-/**
- * @brief      Arduino main function. Runs the inferencing loop.
- */
+/* Main loop - runs continuously performing inference at regular intervals */
 void loop() {
-    ei_printf("Starting inferencing in 2 seconds...\n");
-    delay(2000);
+    /* Calculate required samples for the desired inference interval */
+    int samples_to_wait = (INFERENCE_EVERY_MS * EI_CLASSIFIER_FREQUENCY) / 1000;
 
-    ei_printf("Recording...\n");
+    /* Check if enough samples have been collected for next inference */
+    if (samples_since_last_inference >= samples_to_wait) {
+        samples_since_last_inference = 0;  /* Reset counter for next inference */
 
-    /* Record audio into the big buffer */
-    bool m = microphone_inference_record();
-    if (!m) {
-        ei_printf("ERR: Failed to record audio...\n");
-        return;
-    }
+        /* Wait until we have enough data in the buffer before first inference */
+        if (!buffer_filled_once && write_index < EI_CLASSIFIER_RAW_SAMPLE_COUNT) {
+            return;
+        }
 
-    ei_printf("Recording done\n");
-
-    /* Calculate sliding window parameters */
-    int window_samples = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
-    int stride_samples = (WINDOW_STEP_MS * EI_CLASSIFIER_FREQUENCY) / 1000;
-    
-    std::vector<DetectedKeyword> raw_detections;
-
-    /* * Sliding Window Algorithm:
-     * Iterate through the total recorded buffer (3s) in small steps (stride).
-     * This ensures keywords split between seconds are captured correctly.
-     */
-    for (int offset = 0; offset <= TOTAL_SAMPLES - window_samples; offset += stride_samples) {
-        window_offset = offset; /* Update global offset for the lambda function */
-
+        /* Prepare signal structure for classifier */
         signal_t signal;
-        signal.total_length = window_samples;
-        
-        /* * Lambda function to feed data to the classifier.
-         * It converts int16 data to float on-the-fly to save RAM.
-         */
-        signal.get_data = [](size_t off, size_t len, float *out_ptr) -> int {
-            /* Calculate actual index in the main buffer */
-            int idx_in_big_buffer = window_offset + off;
-            
-            /* Convert only the necessary chunk from int16 to float */
-            numpy::int16_to_float(&inference.buffer[idx_in_big_buffer], out_ptr, len);
-            
-            return 0;
+        signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
+
+        /* Lambda function to read data from circular buffer */
+        signal.get_data = [](size_t offset, size_t length, float* out_ptr) -> int {
+            /* Calculate starting read position (most recent samples) */
+            int read_start_index = write_index - EI_CLASSIFIER_RAW_SAMPLE_COUNT + offset;
+
+            /* Handle circular buffer wraparound */
+            if (read_start_index < 0)
+                read_start_index += RING_BUFFER_SIZE;
+            else if (read_start_index >= RING_BUFFER_SIZE)
+                read_start_index -= RING_BUFFER_SIZE;
+
+            /* Copy samples from ring buffer to output, converting to float */
+            for (size_t i = 0; i < length; i++) {
+                int idx = (read_start_index + i) % RING_BUFFER_SIZE;
+                out_ptr[i] = (float)ring_buffer[idx];
+            }
+            return 0;  /* Success */
         };
 
+        /* Initialize result structure and run classifier */
         ei_impulse_result_t result = {0};
-
-        /* Run inference on the current window slice */
         EI_IMPULSE_ERROR r = run_classifier(&signal, &result, false);
+        if (r != EI_IMPULSE_OK) return;  /* Exit if classifier fails */
 
-        if (r != EI_IMPULSE_OK) {
-            ei_printf("ERR: Failed to run classifier (%d)\n", r);
-            break;
-        }
+        /* Find the classification with highest confidence */
+        float max_val = 0;
+        const char* max_lbl = "_unknown";
 
-        /* Find the label with the highest confidence */
-        float max_value = 0;
-        const char *max_label = "unknown";
-        
         for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-            if (result.classification[ix].value > max_value) {
-                max_value = result.classification[ix].value;
-                max_label = result.classification[ix].label;
+            if (result.classification[ix].value > max_val) {
+                max_val = result.classification[ix].value;
+                max_lbl = result.classification[ix].label;
             }
         }
 
-        /* Store valid detections */
-        if (max_value > PREDICTION_THRESHOLD && strcmp(max_label, "_unknown") != 0 && strcmp(max_label, "_noise") != 0) {
-            /* Calculate timestamp relative to the start of recording */
-            unsigned long timestamp_ms = (offset * 1000) / EI_CLASSIFIER_FREQUENCY;
-            
-            raw_detections.push_back({String(max_label), timestamp_ms, max_value});
+        /* Vector to store valid detections */
+        std::vector<DetectedKeyword> current_detection;
+        ei_printf("Debug: %s = %.2f\n", max_lbl, max_val);
+
+        /* Filter out low confidence predictions and noise/unknown labels */
+        if (max_val > PREDICTION_THRESHOLD && strcmp(max_lbl, "_unknown") != 0 && strcmp(max_lbl, "_noise") != 0 &&
+            strcmp(max_lbl, "unknown") != 0 && strcmp(max_lbl, "noise") != 0) {
+            /* Add valid detection to vector with timestamp */
+            current_detection.push_back({String(max_lbl), millis(), max_val});
+            ei_printf("Detected: %s (%.2f)\n", max_lbl, max_val);
+        }
+
+        /* Process detection through finite state machine */
+        process_fsm(current_detection);
+    }
+}
+
+/* Finite State Machine processor - handles wake word and command logic */
+void process_fsm(std::vector<DetectedKeyword> detections) {
+    unsigned long current_time = millis();
+
+    /* Check timeout - if listening state but no command for too long, go to sleep */
+    if (current_state == STATE_LISTENING) {
+        if (current_time - last_wake_time > LISTENING_TIMEOUT_MS) {
+            /* Transition back to idle state */
+            current_state = STATE_IDLE;
+            active_history.clear();  /* Clear command history */
+
+            /* Red LED: System sleeping */
+            RGB_control(true, false, false);
+            ei_printf("--- TIMEOUT: System Sleep (Waiting for 'hello') ---\n");
         }
     }
 
-    /* Process the list of raw detections to form commands */
-    process_command(raw_detections);
-}
+    /* Exit if no detections to process */
+    if (detections.empty()) return;
+    DetectedKeyword d = detections[0];  /* Get the detected keyword */
 
-/**
- * @brief      Process detected commands with logic (Debouncing & Semantic Parsing)
- * @param[in]  detections  The list of raw detections from the sliding window
- */
-void process_command(std::vector<DetectedKeyword> detections) {
-    if (detections.empty()) {
-        ei_printf("No valid commands detected.\n");
-        return;
-    }
+    /* Process FSM based on current state */
+    switch (current_state) {
+        /* IDLE State - waiting for wake word */
+        case STATE_IDLE:
+            /* Only respond to WAKE keyword */
+            if (d.label == "WAKE") {
+                /* Transition to listening state */
+                current_state = STATE_LISTENING;
+                last_wake_time = current_time;  /* Record wake time for timeout */
 
-    /* Step 1: Debouncing / filtering duplicates */
-    std::vector<DetectedKeyword> unique_cmds;
+                /* Blue LED: Awake and listening */
+                RGB_control(false, false, true);
 
-    for (auto &d : detections) {
-        bool merged = false;
-        if (!unique_cmds.empty()) {
-            DetectedKeyword &last = unique_cmds.back();
+                /* Provide audio feedback */
+                digitalWrite(BUZZER_PIN, HIGH);
+                delay(500);
+                digitalWrite(BUZZER_PIN, LOW);
+                ei_printf(">>> WAKE WORD DETECTED! ('hello') -> Listening...\n");
+            }
+            break;
 
-            /* If the same label appears within 450ms, consider it the same word */
-            if (d.label == last.label && (d.timestamp - last.timestamp) < 450) {
-                if (d.confidence > last.confidence) {
-                    last = d; /* Keep the one with higher confidence */
+        /* LISTENING State - processing commands */
+        case STATE_LISTENING:
+            /* Update timeout timer on each valid detection */
+            last_wake_time = current_time;
+
+            /* Add keyword to history buffer (maintains last 5 commands) */
+            active_history.push_back({d.label, d.timestamp});
+            if (active_history.size() > 5) active_history.pop_front();  /* Remove oldest */
+
+            /* Parse command sequence from history */
+            String action = "";  /* Will be ON or OFF */
+            String device = "";  /* Will be LED or FAN */
+
+            /* Analyze recent history to find action-device pairs */
+            for (auto& h : active_history) {
+                /* Only consider keywords from last 2 seconds */
+                if (current_time - h.timestamp > 2000) continue;
+
+                /* Identify action keywords */
+                if (h.label == "ON" || h.label == "OFF")
+                    action = h.label;
+                /* Identify device keywords */
+                else if (h.label == "LED" || h.label == "FAN")
+                    device = h.label;
+            }
+
+            /* If we have both action and device, execute command */
+            if (action != "" && device != "") {
+                ei_printf(">>> COMMAND MATCHED: %s %s <<<\n", device.c_str(), action.c_str());
+
+                /* Green LED: Command executed successfully */
+                RGB_control(false, true, false);
+
+                /* Execute hardware control based on parsed command */
+                if (device == "LED") {
+                    /* Control built-in LED */
+                    digitalWrite(LED_BUILTIN, (action == "ON") ? HIGH : LOW);
+                } else if (device == "FAN") {
+                    /* Control fan motor */
+                    fan_control(action == "ON");
                 }
-                merged = true;
+
+                /* Clear history after execution to prevent command repeat */
+                active_history.clear();
+
+                /* Stay in listening state to accept more commands */
+                delay(500);  /* Brief pause for visual feedback */
+                RGB_control(false, false, true);  /* Return to blue LED */
             }
-        }
-        if (!merged) {
-            unique_cmds.push_back(d);
-        }
-    }
-
-    /* Print the filtered sequence */
-    String sequence_str = "";
-    for (auto &d : unique_cmds) {
-        ei_printf("  > %s (at %dms, conf: %.2f)\n", d.label.c_str(), d.timestamp, d.confidence);
-        sequence_str += d.label + " ";
-    }
-
-    /* Step 2: Semantic Parsing (Action + Device) */
-    String action = "";
-    String device = "";
-    long action_time = -1;
-    long device_time = -1;
-
-    for (auto &d : unique_cmds) {
-        if (d.label == "ON" || d.label == "OFF") {
-            action = d.label;
-            action_time = d.timestamp;
-        } 
-        else if (d.label == "TURN") {
-            /* "TURN" is a trigger word, usually followed by ON/OFF or implies ON */
-            if (action == "") {
-                 /* Logic for standalone TURN can be added here */
-            }
-        }
-        else if (d.label == "LED" || d.label == "FAN") {
-            device = d.label;
-            device_time = d.timestamp;
-        }
-    }
-
-    /* Step 3: Execute Command if logic is satisfied */
-    if (device != "" && action != "") {
-        /* Check if Action and Device were spoken close to each other (within 2.5s) */
-        if (abs(device_time - action_time) < 2500) {
-            ei_printf("=> COMMAND MATCHED: %s %s\n", device.c_str(), action.c_str());
-            
-            /* Actuator Logic */
-            if (device == "LED") {
-                if (action == "ON") {
-                    digitalWrite(LED_BUILTIN, HIGH);
-                    ei_printf("   [ACTUATOR] LED turned ON\n");
-                } else {
-                    digitalWrite(LED_BUILTIN, LOW);
-                    ei_printf("   [ACTUATOR] LED turned OFF\n");
-                }
-            } 
-            else if (device == "FAN") {
-                if (action == "ON") {
-                    motor_control(true, false, 200); /* Forward at speed 200 */
-                    RGB_control(false, true, false); /* Indicate FAN ON with GREEN LED */
-                    ei_printf("   [ACTUATOR] FAN turned ON\n");
-                } else {
-                    motor_control(false, true, 0); /* Stop */
-                    RGB_control(true, false, false); /* Indicate FAN OFF with RED LED */
-                    ei_printf("   [ACTUATOR] FAN turned OFF\n");
-                }
-            }
-        } else {
-            ei_printf("=> IGNORED: Device and Action too far apart in time.\n");
-        }
-    } else {
-        ei_printf("=> INCOMPLETE: Missing Device or Action.\n");
+            break;
     }
 }
 
-void motor_control(bool forward, bool backward, int speed) {
-    if (forward) {
-        digitalWrite(L298N_IN1, HIGH);
-        digitalWrite(L298N_IN2, LOW);
-    } else if (backward) {
-        digitalWrite(L298N_IN1, LOW);
-        digitalWrite(L298N_IN2, HIGH);
-    } else {
-        digitalWrite(L298N_IN1, LOW);
-        digitalWrite(L298N_IN2, LOW);
-    }
-    analogWrite(L298N_ENA, speed);
+/* Fan control function - turns fan motor on or off */
+void fan_control(bool on) {
+    digitalWrite(FAN_PIN, on ? HIGH : LOW);  /* Set fan pin state */
 }
 
-/**
- * @brief      Helper to control RGB LED
- */
-void RGB_control(bool red, bool green, bool blue) {
-    digitalWrite(LEDR, red ? HIGH : LOW);
-    digitalWrite(LEDG, green ? HIGH : LOW);
-    digitalWrite(LEDB, blue ? HIGH : LOW);
-}
-
-/**
- * @brief      PDM buffer full callback.
- * Reads data from PDM hardware into the intermediate buffer.
- */
+/* ISR callback function - called when PDM microphone has new data available */
 static void pdm_data_ready_inference_callback(void) {
+    /* Check how many bytes are available from the microphone */
     int bytesAvailable = PDM.available();
+    /* Read audio data into temporary buffer */
+    int bytesRead = PDM.read((char*)&sampleBuffer[0], bytesAvailable);
+    /* Calculate number of samples (each sample is 2 bytes/16-bit) */
+    int samplesRead = bytesRead / 2;
 
-    /* Read into the sample buffer */
-    int bytesRead = PDM.read((char *)&sampleBuffer[0], bytesAvailable);
-
-    if (inference.buf_ready == 0) {
-        for (int i = 0; i < bytesRead >> 1; i++) {
-            inference.buffer[inference.buf_count++] = sampleBuffer[i];
-
-            if (inference.buf_count >= inference.n_samples) {
-                inference.buf_ready = 1;
-                break;
-            }
+    /* Transfer samples from temporary buffer to circular ring buffer */
+    for (int i = 0; i < samplesRead; i++) {
+        ring_buffer[write_index] = sampleBuffer[i];
+        write_index++;  /* Advance write position */
+        /* Handle circular buffer wraparound */
+        if (write_index >= RING_BUFFER_SIZE) {
+            write_index = 0;  /* Wrap to beginning */
+            buffer_filled_once = true;  /* Mark buffer as having valid data */
         }
     }
+    /* Update sample counter for inference timing */
+    samples_since_last_inference += samplesRead;
 }
 
-/**
- * @brief      Initialize PDM microphone and allocate buffers.
- */
-static bool microphone_inference_start(uint32_t n_samples) {
-    inference.buffer = (int16_t *)malloc(n_samples * sizeof(int16_t));
-
-    if (inference.buffer == NULL) {
-        return false;
-    }
-
-    inference.buf_count = 0;
-    inference.n_samples = n_samples;
-    inference.buf_ready = 0;
-
-    /* Configure PDM callback */
-    PDM.onReceive(&pdm_data_ready_inference_callback);
-    PDM.setBufferSize(4096);
-
-    /* Initialize PDM: Mono, 16kHz */
-    if (!PDM.begin(1, EI_CLASSIFIER_FREQUENCY)) {
-        ei_printf("Failed to start PDM!");
-        microphone_inference_end();
-        return false;
-    }
-
-    PDM.setGain(127);
-    return true;
+/* RGB LED control function - manages status indication LEDs */
+/* Note: LEDs are active-low (LOW = ON, HIGH = OFF) */
+void RGB_control(bool red, bool green, bool blue) {
+    digitalWrite(LEDR, red ? LOW : HIGH);    /* Control red LED */
+    digitalWrite(LEDG, green ? LOW : HIGH);  /* Control green LED */
+    digitalWrite(LEDB, blue ? LOW : HIGH);   /* Control blue LED */
 }
-
-/**
- * @brief      Wait for PDM data to fill the buffer.
- */
-static bool microphone_inference_record(void) {
-    inference.buf_ready = 0;
-    inference.buf_count = 0;
-
-    while (inference.buf_ready == 0) {
-        delay(10);
-    }
-
-    return true;
-}
-
-/**
- * @brief      Stop PDM and release memory.
- */
-static void microphone_inference_end(void) {
-    PDM.end();
-    free(inference.buffer);
-}
-
-#if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_MICROPHONE
-#error "Invalid model for current sensor."
-#endif
