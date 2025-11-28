@@ -46,7 +46,7 @@
 #include "edge-impulse-sdk/classifier/inferencing_engines/engines.h"
 #include "edge-impulse-sdk/classifier/postprocessing/ei_postprocessing_common.h"
 
-const char* ei_classifier_inferencing_categories_822117_1[] = { "FAN", "LED", "OFF", "ON", "TURN", "_noise", "_unknown" };
+const char* ei_classifier_inferencing_categories_822117_1[] = { "FAN", "LED", "OFF", "ON", "WAKE", "_noise", "_unknown" };
 
 ei_dsp_named_axis_t ei_dsp_config_822117_3_named_axes[] = {
     { .name = "Signal", .axis = 0 }
@@ -151,7 +151,7 @@ const ei_impulse_t impulse_822117_1 = {
     .project_name = "Speech Recognition",
     .impulse_id = 1,
     .impulse_name = "Impulse #1",
-    .deploy_version = 6,
+    .deploy_version = 9,
 
     .nn_input_frame_size = 637,
     .raw_sample_count = 16000,
