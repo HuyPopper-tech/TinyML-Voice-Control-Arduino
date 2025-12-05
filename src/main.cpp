@@ -1,311 +1,787 @@
-/* Voice-controlled IoT system using Edge Impulse speech recognition */
-/* Supports wake word detection and command execution for LED and FAN control */
+/* ============================================================================
+ * Voice-controlled IoT System using Edge Impulse Speech Recognition
+ * ============================================================================ */
 
-#include <Arduino.h>
-#include <PDM.h>  /* Pulse Density Modulation microphone library */
-#include <Speech_Recognition_inferencing.h>  /* Edge Impulse inference library */
+#include <PDM.h>                            /* Pulse Density Modulation microphone library */
+#include <Speech_Recognition_inferencing.h> /* Edge Impulse inference library */
 
-#include <deque>  /* For command history queue */
-#include <string>  /* For string operations */
-#include <vector>  /* For detection results */
+/* ============================================================================
+ * CONFIGURATION CONSTANTS
+ * ============================================================================ */
 
-/* Enable quantization for filterbank to optimize memory usage */
-#define EIDSP_QUANTIZE_FILTERBANK    1
+/* Enable quantization for filterbank to optimize memory usage on Cortex-M4 */
+#define EIDSP_QUANTIZE_FILTERBANK 1
 
-/* Perform inference every 300ms for responsive detection */
-#define INFERENCE_EVERY_MS           300
-/* Minimum confidence threshold (70%) to accept a prediction */
-#define PREDICTION_THRESHOLD         0.7f
+/* Inference timing - perform inference every 100ms for responsive detection */
+#define INFERENCE_EVERY_MS 100
+
+/* Minimum confidence threshold (80%) to accept a single-frame prediction */
+#define PREDICTION_THRESHOLD 0.8f
+
 /* Timeout period (5 seconds) - system returns to idle if no command received */
-#define LISTENING_TIMEOUT_MS         5000
+#define LISTENING_TIMEOUT_MS 5000
 
-/* Circular buffer size matching the classifier's required sample count */
-#define RING_BUFFER_SIZE             (EI_CLASSIFIER_RAW_SAMPLE_COUNT)
+/* ============================================================================
+ * VOICE ACTIVITY DETECTION (VAD) PARAMETERS
+ * Combined Energy + Zero-Crossing Rate for improved accuracy
+ * ============================================================================ */
 
-/* Hardware pin definitions */
-#define BUZZER_PIN                   D2  /* Buzzer for audio feedback */
-#define FAN_PIN                      D3  /* Fan control output */
+#define VAD_ENERGY_THRESHOLD 1000    /* Minimum energy level to consider as speech */
+#define VAD_ZCR_SPEECH_MAX 0.15f     /* Maximum ZCR for voiced speech (lower = more voiced) */
+#define VAD_ZCR_NOISE_MIN 0.30f      /* Minimum ZCR considered as noise/unvoiced */
+#define VAD_ENERGY_WEIGHT 0.7f       /* Weight for energy component in combined VAD */
+#define VAD_ZCR_WEIGHT 0.3f          /* Weight for ZCR component in combined VAD */
+#define VAD_FRAMES_REQUIRED 3        /* Consecutive frames needed to confirm voice onset */
+#define VAD_SILENCE_FRAMES_TIMEOUT 8 /* Consecutive silent frames to confirm voice offset */
+#define VAD_HYSTERESIS_FACTOR 0.7f   /* Hysteresis factor to prevent rapid state switching */
 
-/* Circular buffer for audio samples used by the classifier */
+/* ============================================================================
+ * DUPLICATE DETECTION AND DEBOUNCING PARAMETERS
+ * ============================================================================ */
+
+#define SAME_LABEL_COOLDOWN_MS 400 /* Minimum time between same label detections */
+#define MIN_CONFIDENCE_DIFF 0.15f  /* Confidence increase required to override cooldown */
+#define MIN_WORDS_INTERVAL_MS 150  /* Minimum interval between different words */
+
+/* ============================================================================
+ * COMMAND PARSING PARAMETERS
+ * ============================================================================ */
+
+#define COMMAND_WINDOW_MS 1500 /* Time window to collect device + action pair */
+#define COMMAND_HISTORY_SIZE 5 /* Maximum keywords stored in history buffer */
+
+/* ============================================================================
+ * POSTERIOR SMOOTHING AND CONFIDENCE ACCUMULATION
+ * These techniques reduce false positives and missed detections
+ * ============================================================================ */
+
+#define SMOOTHING_WINDOW 4          /* Number of frames for moving average smoothing */
+#define ACCUMULATION_THRESHOLD 1.2f /* Accumulated score threshold to accept detection */
+#define ACCUMULATION_DECAY 0.75f    /* Decay factor for older frames in accumulation */
+
+/* ============================================================================
+ * BUFFER SIZES
+ * ============================================================================ */
+
+#define RING_BUFFER_SIZE (EI_CLASSIFIER_RAW_SAMPLE_COUNT)
+#define VAD_SAMPLE_SIZE 256  /* Number of samples for VAD analysis */
+#define PDM_BUFFER_SIZE 2048 /* PDM microphone buffer size */
+
+/* ============================================================================
+ * HARDWARE PIN DEFINITIONS
+ * ============================================================================ */
+
+#define BUZZER_PIN D2 /* Buzzer for audio feedback */
+#define FAN_PIN D3    /* Fan control output */
+
+/* ============================================================================
+ * KEYWORD LABEL ENUMERATION
+ * Using enum instead of String to avoid heap fragmentation on embedded systems
+ * ============================================================================ */
+
+typedef enum {
+    LABEL_UNKNOWN = 0,
+    LABEL_NOISE,
+    LABEL_WAKE,
+    LABEL_ON,
+    LABEL_OFF,
+    LABEL_LED,
+    LABEL_FAN,
+    LABEL_COUNT
+} KeywordLabel;
+
+/* Lookup table to convert label string to enum */
+static const char* LABEL_STRINGS[] = {"_unknown", "_noise", "WAKE", "ON", "OFF", "LED", "FAN"};
+
+/* ============================================================================
+ * SYSTEM STATE MACHINE
+ * ============================================================================ */
+
+typedef enum {
+    STATE_IDLE,     /* Waiting for wake word - low power mode */
+    STATE_LISTENING /* Active listening for device + action commands */
+} SystemState;
+
+/* ============================================================================
+ * DATA STRUCTURES (Static allocation to avoid heap fragmentation)
+ * ============================================================================ */
+
+/* Structure to store detected keyword information */
+typedef struct {
+    KeywordLabel label;      /* Detected keyword label (enum) */
+    unsigned long timestamp; /* Time of detection in milliseconds */
+    float confidence;        /* Confidence score (0.0 to 1.0) */
+} DetectedKeyword;
+
+/* Structure for command history - static circular buffer */
+typedef struct {
+    DetectedKeyword items[COMMAND_HISTORY_SIZE];
+    uint8_t head;  /* Index of oldest item */
+    uint8_t count; /* Number of items in buffer */
+} CommandHistory;
+
+/* Structure for posterior smoothing history */
+typedef struct {
+    float values[EI_CLASSIFIER_LABEL_COUNT];
+    unsigned long timestamp;
+} PosteriorFrame;
+
+/* Structure for confidence accumulation across multiple frames */
+typedef struct {
+    float scores[EI_CLASSIFIER_LABEL_COUNT];
+} AccumulatedConfidence;
+
+/* ============================================================================
+ * GLOBAL VARIABLES
+ * ============================================================================ */
+
+/* Audio ring buffer for continuous sampling */
 static int16_t ring_buffer[RING_BUFFER_SIZE];
-/* Current write position in the ring buffer (volatile for ISR access) */
 static volatile int write_index = 0;
-/* Flag indicating if the buffer has wrapped around at least once */
 static volatile bool buffer_filled_once = false;
-/* Counter tracking samples collected since last inference */
 static int samples_since_last_inference = 0;
 
 /* Temporary buffer for PDM microphone data */
-static short sampleBuffer[2048];
+static int16_t pdm_sample_buffer[PDM_BUFFER_SIZE];
 
-/* FSM States */
-enum SystemState {
-    STATE_IDLE,       /* Waiting for wake word */
-    STATE_LISTENING,  /* Active listening for commands */
-};
+/* Voice Activity Detection state */
+static int vad_active_frames = 0;
+static int vad_silence_frames = 0;
+static bool voice_detected = false;
+static float adaptive_vad_threshold = 0.3f;
 
-/* Current system state - starts in idle mode */
-SystemState current_state = STATE_IDLE;
-/* Timestamp of last wake word detection or command - used for timeout */
-unsigned long last_wake_time = 0;
+/* System state machine */
+static SystemState current_state = STATE_IDLE;
+static unsigned long last_wake_time = 0;
 
-/* Structure to hold detected keyword information */
-struct DetectedKeyword {
-    String label;              /* Detected keyword label */
-    unsigned long timestamp;   /* Time of detection */
-    float confidence;          /* Confidence score (0.0 to 1.0) */
-};
+/* Command history buffer (static circular buffer) */
+static CommandHistory cmd_history = {{}, 0, 0};
 
-/* Structure to store command history for sequence analysis */
-struct CommandHistory {
-    String label;              /* Command label */
-    unsigned long timestamp;   /* Time of detection */
-};
-/* Queue storing recent commands (max 5) for pattern matching */
-std::deque<CommandHistory> active_history;
+/* Last detection for duplicate filtering */
+static DetectedKeyword last_detection = {LABEL_UNKNOWN, 0, 0.0f};
 
-/* FSM processing function - handles state transitions and command execution */
-void process_fsm(std::vector<DetectedKeyword> detections);
-/* Controls the RGB LED with specified colors (true = on, false = off) */
-void RGB_control(bool red, bool green, bool blue);
-/* Controls the fan motor (true = on, false = off) */
-void fan_control(bool on);
-/* ISR callback for PDM microphone - fills ring buffer with audio samples */
-static void pdm_data_ready_inference_callback(void);
+/* Posterior smoothing buffer (static circular buffer) */
+static PosteriorFrame posterior_history[SMOOTHING_WINDOW];
+static uint8_t posterior_head = 0;
+static uint8_t posterior_count = 0;
 
-/* System initialization - runs once at startup */
-void setup() {
-    /* Initialize serial communication at high baud rate for debugging */
-    Serial.begin(921600);
-    while (!Serial);  /* Wait for serial port to connect */
+/* Confidence accumulator */
+static AccumulatedConfidence accumulated = {{0}};
 
-    Serial.println("Edge Impulse Wake Word Demo (Continuous)");
+/* ============================================================================
+ * FUNCTION PROTOTYPES
+ * ============================================================================ */
 
-    /* Configure all output pins */
-    pinMode(LED_BUILTIN, OUTPUT);  /* Built-in LED for user control */
-    pinMode(LEDR, OUTPUT);         /* Red LED for status indication */
-    pinMode(LEDG, OUTPUT);         /* Green LED for status indication */
-    pinMode(LEDB, OUTPUT);         /* Blue LED for status indication */
-    pinMode(BUZZER_PIN, OUTPUT);   /* Buzzer for audio feedback */
-    pinMode(FAN_PIN, OUTPUT);      /* Fan control output */
+static void pdm_data_ready_callback(void);
+static KeywordLabel string_to_label(const char* str);
+static const char* label_to_string(KeywordLabel label);
+static float calculate_energy(const int16_t* data, size_t length);
+static float calculate_zcr(const int16_t* data, size_t length);
+static bool check_vad_enhanced(const int16_t* data, size_t length);
+static void get_smoothed_posteriors(ei_impulse_result_t* result, float* smoothed);
+static void update_accumulator(const float* smoothed);
+static int get_best_accumulated_label(float* out_score);
+static void reset_accumulator(void);
+static void reset_posterior_history(void);
+static bool is_duplicate_detection(KeywordLabel label, float confidence, unsigned long current_time);
+static void update_last_detection(KeywordLabel label, float confidence, unsigned long current_time);
+static void history_push(DetectedKeyword item);
+static void history_clear(void);
+static void process_fsm(KeywordLabel label, float confidence, unsigned long timestamp);
+static void execute_command(KeywordLabel device, KeywordLabel action);
+static void RGB_control(bool red, bool green, bool blue);
+static void fan_control(bool on);
+static void beep_feedback(int duration_ms);
 
-    /* Set initial state - Red LED indicates idle/sleeping state */
-    RGB_control(true, false, false);
-    digitalWrite(BUZZER_PIN, LOW);  /* Ensure buzzer is off */
+/* ============================================================================
+ * UTILITY FUNCTIONS
+ * ============================================================================ */
 
-    /* Display classifier configuration for debugging */
-    ei_printf("Inferencing settings:\n");
-    ei_printf("\tInterval: %.2f ms.\n", (float)EI_CLASSIFIER_INTERVAL_MS);
-    ei_printf("\tFrame size: %d\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
-
-    /* Configure PDM microphone */
-    PDM.onReceive(&pdm_data_ready_inference_callback);  /* Set ISR callback */
-    PDM.setBufferSize(2048);  /* Set buffer size for audio samples */
-    if (!PDM.begin(1, EI_CLASSIFIER_FREQUENCY)) {  /* Start PDM with classifier frequency */
-        ei_printf("Failed to start PDM!");
-        while (1);  /* Halt execution on failure */
-    }
-    PDM.begin(1, 16000);  /* Mono channel, 16kHz sampling rate */
-    PDM.setGain(127);     /* Set microphone gain to maximum */
+/* Convert label string from classifier to enum for efficient comparison */
+static KeywordLabel string_to_label(const char* str) {
+    if (strcmp(str, "WAKE") == 0) return LABEL_WAKE;
+    if (strcmp(str, "ON") == 0) return LABEL_ON;
+    if (strcmp(str, "OFF") == 0) return LABEL_OFF;
+    if (strcmp(str, "LED") == 0) return LABEL_LED;
+    if (strcmp(str, "FAN") == 0) return LABEL_FAN;
+    if (strcmp(str, "_noise") == 0 || strcmp(str, "noise") == 0) return LABEL_NOISE;
+    return LABEL_UNKNOWN;
 }
 
-/* Main loop - runs continuously performing inference at regular intervals */
-void loop() {
-    /* Calculate required samples for the desired inference interval */
-    int samples_to_wait = (INFERENCE_EVERY_MS * EI_CLASSIFIER_FREQUENCY) / 1000;
+/* Convert enum back to string for debugging output */
+static const char* label_to_string(KeywordLabel label) {
+    if (label >= 0 && label < LABEL_COUNT) {
+        return LABEL_STRINGS[label];
+    }
+    return "_unknown";
+}
 
-    /* Check if enough samples have been collected for next inference */
-    if (samples_since_last_inference >= samples_to_wait) {
-        samples_since_last_inference = 0;  /* Reset counter for next inference */
+/* ============================================================================
+ * VOICE ACTIVITY DETECTION (VAD) FUNCTIONS
+ * Enhanced VAD using both Energy and Zero-Crossing Rate
+ * ============================================================================ */
 
-        /* Wait until we have enough data in the buffer before first inference */
-        if (!buffer_filled_once && write_index < EI_CLASSIFIER_RAW_SAMPLE_COUNT) {
-            return;
+/* Calculate average energy (mean squared amplitude) of audio samples */
+static float calculate_energy(const int16_t* data, size_t length) {
+    float energy = 0.0f;
+    for (size_t i = 0; i < length; i++) {
+        float sample = (float)data[i];
+        energy += sample * sample;
+    }
+    return energy / (float)length;
+}
+
+/* Calculate Zero-Crossing Rate - ratio of sign changes in the signal
+ * Lower ZCR typically indicates voiced speech, higher ZCR indicates noise/unvoiced */
+static float calculate_zcr(const int16_t* data, size_t length) {
+    if (length < 2) return 0.0f;
+
+    int zero_crossings = 0;
+    for (size_t i = 1; i < length; i++) {
+        /* Count sign changes between consecutive samples */
+        if ((data[i] >= 0 && data[i - 1] < 0) || (data[i] < 0 && data[i - 1] >= 0)) {
+            zero_crossings++;
         }
+    }
+    return (float)zero_crossings / (float)(length - 1);
+}
 
-        /* Prepare signal structure for classifier */
-        signal_t signal;
-        signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
+/* Enhanced VAD combining Energy and ZCR with hysteresis for stability */
+static bool check_vad_enhanced(const int16_t* data, size_t length) {
+    float energy = calculate_energy(data, length);
+    float zcr = calculate_zcr(data, length);
 
-        /* Lambda function to read data from circular buffer */
-        signal.get_data = [](size_t offset, size_t length, float* out_ptr) -> int {
-            /* Calculate starting read position (most recent samples) */
-            int read_start_index = write_index - EI_CLASSIFIER_RAW_SAMPLE_COUNT + offset;
+    /* Normalize energy using log scale for better dynamic range */
+    float energy_norm = (energy > 1.0f) ? (log10f(energy) / 10.0f) : 0.0f;
+    if (energy_norm > 1.0f) energy_norm = 1.0f;
 
-            /* Handle circular buffer wraparound */
-            if (read_start_index < 0)
-                read_start_index += RING_BUFFER_SIZE;
-            else if (read_start_index >= RING_BUFFER_SIZE)
-                read_start_index -= RING_BUFFER_SIZE;
+    /* Convert ZCR to speech likelihood score (lower ZCR = more likely speech) */
+    float zcr_score = 1.0f - (zcr / VAD_ZCR_NOISE_MIN);
+    if (zcr_score < 0.0f) zcr_score = 0.0f;
+    if (zcr_score > 1.0f) zcr_score = 1.0f;
 
-            /* Copy samples from ring buffer to output, converting to float */
-            for (size_t i = 0; i < length; i++) {
-                int idx = (read_start_index + i) % RING_BUFFER_SIZE;
-                out_ptr[i] = (float)ring_buffer[idx];
-            }
-            return 0;  /* Success */
-        };
+    /* Combine energy and ZCR scores with weighted average */
+    float vad_score = VAD_ENERGY_WEIGHT * energy_norm + VAD_ZCR_WEIGHT * zcr_score;
 
-        /* Initialize result structure and run classifier */
-        ei_impulse_result_t result = {0};
-        EI_IMPULSE_ERROR r = run_classifier(&signal, &result, false);
-        if (r != EI_IMPULSE_OK) return;  /* Exit if classifier fails */
+    /* Apply hysteresis to prevent rapid state switching */
+    float threshold = voice_detected ? (adaptive_vad_threshold * VAD_HYSTERESIS_FACTOR) : adaptive_vad_threshold;
 
-        /* Find the classification with highest confidence */
-        float max_val = 0;
-        const char* max_lbl = "_unknown";
-
-        for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-            if (result.classification[ix].value > max_val) {
-                max_val = result.classification[ix].value;
-                max_lbl = result.classification[ix].label;
-            }
+    /* State machine for robust voice onset/offset detection */
+    if (vad_score > threshold) {
+        vad_active_frames++;
+        vad_silence_frames = 0;
+        if (vad_active_frames >= VAD_FRAMES_REQUIRED) {
+            voice_detected = true;
         }
-
-        /* Vector to store valid detections */
-        std::vector<DetectedKeyword> current_detection;
-        ei_printf("Debug: %s = %.2f\n", max_lbl, max_val);
-
-        /* Filter out low confidence predictions and noise/unknown labels */
-        if (max_val > PREDICTION_THRESHOLD && strcmp(max_lbl, "_unknown") != 0 && strcmp(max_lbl, "_noise") != 0 &&
-            strcmp(max_lbl, "unknown") != 0 && strcmp(max_lbl, "noise") != 0) {
-            /* Add valid detection to vector with timestamp */
-            current_detection.push_back({String(max_lbl), millis(), max_val});
-            ei_printf("Detected: %s (%.2f)\n", max_lbl, max_val);
+    } else {
+        vad_silence_frames++;
+        if (vad_silence_frames >= VAD_SILENCE_FRAMES_TIMEOUT) {
+            vad_active_frames = 0;
+            voice_detected = false;
         }
+    }
 
-        /* Process detection through finite state machine */
-        process_fsm(current_detection);
+    return voice_detected;
+}
+
+/* ============================================================================
+ * POSTERIOR SMOOTHING FUNCTIONS
+ * Moving average over multiple inference frames to reduce noise
+ * ============================================================================ */
+
+/* Add new posterior to history and compute smoothed output */
+static void get_smoothed_posteriors(ei_impulse_result_t* result, float* smoothed) {
+    /* Store current posteriors in circular buffer */
+    PosteriorFrame* frame = &posterior_history[posterior_head];
+    for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        frame->values[i] = result->classification[i].value;
+    }
+    frame->timestamp = millis();
+
+    /* Advance circular buffer pointer */
+    posterior_head = (posterior_head + 1) % SMOOTHING_WINDOW;
+    if (posterior_count < SMOOTHING_WINDOW) {
+        posterior_count++;
+    }
+
+    /* Compute moving average for each class */
+    for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        float sum = 0.0f;
+        for (uint8_t j = 0; j < posterior_count; j++) {
+            sum += posterior_history[j].values[i];
+        }
+        smoothed[i] = sum / (float)posterior_count;
     }
 }
 
-/* Finite State Machine processor - handles wake word and command logic */
-void process_fsm(std::vector<DetectedKeyword> detections) {
+/* Reset posterior smoothing history (call after successful detection) */
+static void reset_posterior_history(void) {
+    posterior_head = 0;
+    posterior_count = 0;
+    for (int i = 0; i < SMOOTHING_WINDOW; i++) {
+        for (size_t j = 0; j < EI_CLASSIFIER_LABEL_COUNT; j++) {
+            posterior_history[i].values[j] = 0.0f;
+        }
+    }
+}
+
+/* ============================================================================
+ * CONFIDENCE ACCUMULATION FUNCTIONS
+ * Require multiple frames of consistent detection before accepting
+ * ============================================================================ */
+
+/* Update accumulator with new smoothed posteriors using exponential decay */
+static void update_accumulator(const float* smoothed) {
+    for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        /* Apply decay to old value and add new contribution */
+        accumulated.scores[i] = accumulated.scores[i] * ACCUMULATION_DECAY + smoothed[i];
+    }
+}
+
+/* Find label with highest accumulated score */
+static int get_best_accumulated_label(float* out_score) {
+    int best_idx = -1;
+    float best_val = 0.0f;
+
+    for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        if (accumulated.scores[i] > best_val) {
+            best_val = accumulated.scores[i];
+            best_idx = (int)i;
+        }
+    }
+
+    *out_score = best_val;
+    return best_idx;
+}
+
+/* Reset accumulator (call after successful detection or timeout) */
+static void reset_accumulator(void) {
+    for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        accumulated.scores[i] = 0.0f;
+    }
+}
+
+/* ============================================================================
+ * DUPLICATE DETECTION FUNCTIONS
+ * Prevent the same keyword from being detected multiple times in quick succession
+ * ============================================================================ */
+
+/* Check if detection is a duplicate of the previous one */
+static bool is_duplicate_detection(KeywordLabel label, float confidence, unsigned long current_time) {
+    /* Same label within cooldown period */
+    if (label == last_detection.label && (current_time - last_detection.timestamp) < SAME_LABEL_COOLDOWN_MS) {
+        /* Only accept if confidence is significantly higher */
+        if (confidence <= last_detection.confidence + MIN_CONFIDENCE_DIFF) {
+            return true; /* Duplicate - should be ignored */
+        }
+    }
+    return false; /* Not a duplicate - should be processed */
+}
+
+/* Update last detection record */
+static void update_last_detection(KeywordLabel label, float confidence, unsigned long current_time) {
+    last_detection.label = label;
+    last_detection.confidence = confidence;
+    last_detection.timestamp = current_time;
+}
+
+/* ============================================================================
+ * COMMAND HISTORY FUNCTIONS (Static circular buffer implementation)
+ * ============================================================================ */
+
+/* Push new keyword to history buffer */
+static void history_push(DetectedKeyword item) {
+    uint8_t idx;
+    if (cmd_history.count < COMMAND_HISTORY_SIZE) {
+        /* Buffer not full - add to end */
+        idx = (cmd_history.head + cmd_history.count) % COMMAND_HISTORY_SIZE;
+        cmd_history.count++;
+    } else {
+        /* Buffer full - overwrite oldest and advance head */
+        idx = cmd_history.head;
+        cmd_history.head = (cmd_history.head + 1) % COMMAND_HISTORY_SIZE;
+    }
+    cmd_history.items[idx] = item;
+}
+
+/* Clear all items from history */
+static void history_clear(void) {
+    cmd_history.head = 0;
+    cmd_history.count = 0;
+}
+
+/* ============================================================================
+ * FINITE STATE MACHINE (FSM) FOR COMMAND PROCESSING
+ * ============================================================================ */
+
+static void process_fsm(KeywordLabel label, float confidence, unsigned long timestamp) {
     unsigned long current_time = millis();
 
-    /* Check timeout - if listening state but no command for too long, go to sleep */
+    /* Check for timeout in listening state */
     if (current_state == STATE_LISTENING) {
         if (current_time - last_wake_time > LISTENING_TIMEOUT_MS) {
-            /* Transition back to idle state */
+            /* Timeout - return to idle state */
             current_state = STATE_IDLE;
-            active_history.clear();  /* Clear command history */
-
-            /* Red LED: System sleeping */
-            RGB_control(true, false, false);
-            ei_printf("--- TIMEOUT: System Sleep (Waiting for 'hello') ---\n");
+            history_clear();
+            reset_accumulator();
+            reset_posterior_history();
+            RGB_control(true, false, false); /* Red LED: sleeping */
+            ei_printf("--- TIMEOUT: Returning to sleep ---\n");
+            return;
         }
     }
 
-    /* Exit if no detections to process */
-    if (detections.empty()) return;
-    DetectedKeyword d = detections[0];  /* Get the detected keyword */
+    /* Skip if no valid label */
+    if (label == LABEL_UNKNOWN || label == LABEL_NOISE) {
+        return;
+    }
 
-    /* Process FSM based on current state */
+    /* Process based on current state */
     switch (current_state) {
-        /* IDLE State - waiting for wake word */
         case STATE_IDLE:
-            /* Only respond to WAKE keyword */
-            if (d.label == "WAKE") {
-                /* Transition to listening state */
+            /* Only respond to wake word */
+            if (label == LABEL_WAKE) {
                 current_state = STATE_LISTENING;
-                last_wake_time = current_time;  /* Record wake time for timeout */
-
-                /* Blue LED: Awake and listening */
-                RGB_control(false, false, true);
-
-                /* Provide audio feedback */
-                digitalWrite(BUZZER_PIN, HIGH);
-                delay(500);
-                digitalWrite(BUZZER_PIN, LOW);
-                ei_printf(">>> WAKE WORD DETECTED! ('hello') -> Listening...\n");
+                last_wake_time = current_time;
+                history_clear();
+                RGB_control(false, false, true); /* Blue LED: listening */
+                beep_feedback(150);              /* Short beep for feedback */
+                ei_printf(">>> WAKE WORD DETECTED -> Listening... <<<\n");
             }
             break;
 
-        /* LISTENING State - processing commands */
         case STATE_LISTENING:
-            /* Update timeout timer on each valid detection */
+            /* Update timeout timer */
             last_wake_time = current_time;
 
-            /* Add keyword to history buffer (maintains last 5 commands) */
-            active_history.push_back({d.label, d.timestamp});
-            if (active_history.size() > 5) active_history.pop_front();  /* Remove oldest */
+            /* Check for minimum interval between words */
+            if (cmd_history.count > 0) {
+                uint8_t last_idx = (cmd_history.head + cmd_history.count - 1) % COMMAND_HISTORY_SIZE;
+                DetectedKeyword* last_item = &cmd_history.items[last_idx];
 
-            /* Parse command sequence from history */
-            String action = "";  /* Will be ON or OFF */
-            String device = "";  /* Will be LED or FAN */
-
-            /* Analyze recent history to find action-device pairs */
-            for (auto& h : active_history) {
-                /* Only consider keywords from last 2 seconds */
-                if (current_time - h.timestamp > 2000) continue;
-
-                /* Identify action keywords */
-                if (h.label == "ON" || h.label == "OFF")
-                    action = h.label;
-                /* Identify device keywords */
-                else if (h.label == "LED" || h.label == "FAN")
-                    device = h.label;
+                /* Skip if same word detected too quickly */
+                if (current_time - last_item->timestamp < MIN_WORDS_INTERVAL_MS) {
+                    if (last_item->label == label) {
+                        break; /* Skip duplicate */
+                    }
+                }
             }
 
-            /* If we have both action and device, execute command */
-            if (action != "" && device != "") {
-                ei_printf(">>> COMMAND MATCHED: %s %s <<<\n", device.c_str(), action.c_str());
+            /* Add to history */
+            DetectedKeyword new_item = {label, timestamp, confidence};
+            history_push(new_item);
 
-                /* Green LED: Command executed successfully */
-                RGB_control(false, true, false);
+            /* Parse command from history - look for device + action pair */
+            KeywordLabel action = LABEL_UNKNOWN;
+            KeywordLabel device = LABEL_UNKNOWN;
+            float action_score = 0.0f;
+            float device_score = 0.0f;
 
-                /* Execute hardware control based on parsed command */
-                if (device == "LED") {
-                    /* Control built-in LED */
-                    digitalWrite(LED_BUILTIN, (action == "ON") ? HIGH : LOW);
-                } else if (device == "FAN") {
-                    /* Control fan motor */
-                    fan_control(action == "ON");
+            /* Iterate through history from newest to oldest */
+            for (int i = cmd_history.count - 1; i >= 0; i--) {
+                uint8_t idx = (cmd_history.head + i) % COMMAND_HISTORY_SIZE;
+                DetectedKeyword* item = &cmd_history.items[idx];
+
+                /* Skip entries outside command window */
+                if (current_time - item->timestamp > COMMAND_WINDOW_MS) {
+                    continue;
                 }
 
-                /* Clear history after execution to prevent command repeat */
-                active_history.clear();
+                /* Calculate time-weighted score (newer = higher weight) */
+                float time_weight = 1.0f - (float)(current_time - item->timestamp) / (float)COMMAND_WINDOW_MS;
+                float weighted_score = item->confidence * time_weight;
 
-                /* Stay in listening state to accept more commands */
-                delay(500);  /* Brief pause for visual feedback */
-                RGB_control(false, false, true);  /* Return to blue LED */
+                /* Check for action keywords (ON/OFF) */
+                if (item->label == LABEL_ON || item->label == LABEL_OFF) {
+                    if (weighted_score > action_score) {
+                        action = item->label;
+                        action_score = weighted_score;
+                    }
+                }
+
+                /* Check for device keywords (LED/FAN) */
+                if (item->label == LABEL_LED || item->label == LABEL_FAN) {
+                    if (weighted_score > device_score) {
+                        device = item->label;
+                        device_score = weighted_score;
+                    }
+                }
+            }
+
+            /* Execute command if both device and action are found */
+            if (action != LABEL_UNKNOWN && device != LABEL_UNKNOWN) {
+                ei_printf(">>> COMMAND: %s %s (scores: %.2f, %.2f) <<<\n", label_to_string(device),
+                          label_to_string(action), device_score, action_score);
+
+                execute_command(device, action);
+
+                /* Reset for next command */
+                history_clear();
+                last_detection = (DetectedKeyword){LABEL_UNKNOWN, 0, 0.0f};
+
+                /* Visual feedback */
+                RGB_control(false, true, false); /* Green LED: success */
+                beep_feedback(100);
+                delay(200);
+                RGB_control(false, false, true); /* Return to blue */
             }
             break;
     }
 }
 
-/* Fan control function - turns fan motor on or off */
-void fan_control(bool on) {
-    digitalWrite(FAN_PIN, on ? HIGH : LOW);  /* Set fan pin state */
+/* Execute hardware command */
+static void execute_command(KeywordLabel device, KeywordLabel action) {
+    bool turn_on = (action == LABEL_ON);
+
+    if (device == LABEL_LED) {
+        digitalWrite(LED_BUILTIN, turn_on ? HIGH : LOW);
+        ei_printf("LED turned %s\n", turn_on ? "ON" : "OFF");
+    } else if (device == LABEL_FAN) {
+        fan_control(turn_on);
+        ei_printf("FAN turned %s\n", turn_on ? "ON" : "OFF");
+    }
 }
 
-/* ISR callback function - called when PDM microphone has new data available */
-static void pdm_data_ready_inference_callback(void) {
-    /* Check how many bytes are available from the microphone */
-    int bytesAvailable = PDM.available();
-    /* Read audio data into temporary buffer */
-    int bytesRead = PDM.read((char*)&sampleBuffer[0], bytesAvailable);
-    /* Calculate number of samples (each sample is 2 bytes/16-bit) */
-    int samplesRead = bytesRead / 2;
+/* ============================================================================
+ * HARDWARE CONTROL FUNCTIONS
+ * ============================================================================ */
 
-    /* Transfer samples from temporary buffer to circular ring buffer */
-    for (int i = 0; i < samplesRead; i++) {
-        ring_buffer[write_index] = sampleBuffer[i];
-        write_index++;  /* Advance write position */
-        /* Handle circular buffer wraparound */
+/* Control RGB LED - Note: LEDs are active-low on Nano 33 BLE */
+static void RGB_control(bool red, bool green, bool blue) {
+    digitalWrite(LEDR, red ? LOW : HIGH);
+    digitalWrite(LEDG, green ? LOW : HIGH);
+    digitalWrite(LEDB, blue ? LOW : HIGH);
+}
+
+/* Control fan motor */
+static void fan_control(bool on) { digitalWrite(FAN_PIN, on ? HIGH : LOW); }
+
+/* Generate beep feedback */
+static void beep_feedback(int duration_ms) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(duration_ms);
+    digitalWrite(BUZZER_PIN, LOW);
+}
+
+/* ============================================================================
+ * PDM MICROPHONE CALLBACK (ISR)
+ * ============================================================================ */
+
+static void pdm_data_ready_callback(void) {
+    int bytes_available = PDM.available();
+    int bytes_read = PDM.read((char*)pdm_sample_buffer, bytes_available);
+    int samples_read = bytes_read / 2; /* Each sample is 16-bit (2 bytes) */
+
+    /* Transfer samples to ring buffer */
+    for (int i = 0; i < samples_read; i++) {
+        ring_buffer[write_index] = pdm_sample_buffer[i];
+        write_index++;
+
         if (write_index >= RING_BUFFER_SIZE) {
-            write_index = 0;  /* Wrap to beginning */
-            buffer_filled_once = true;  /* Mark buffer as having valid data */
+            write_index = 0;
+            buffer_filled_once = true;
         }
     }
-    /* Update sample counter for inference timing */
-    samples_since_last_inference += samplesRead;
+
+    samples_since_last_inference += samples_read;
 }
 
-/* RGB LED control function - manages status indication LEDs */
-/* Note: LEDs are active-low (LOW = ON, HIGH = OFF) */
-void RGB_control(bool red, bool green, bool blue) {
-    digitalWrite(LEDR, red ? LOW : HIGH);    /* Control red LED */
-    digitalWrite(LEDG, green ? LOW : HIGH);  /* Control green LED */
-    digitalWrite(LEDB, blue ? LOW : HIGH);   /* Control blue LED */
+/* ============================================================================
+ * SETUP - System initialization
+ * ============================================================================ */
+
+void setup() {
+    /* Initialize serial for debugging */
+    Serial.begin(115200);
+    while (!Serial && millis() < 3000); /* Wait max 3 seconds for serial */
+
+    Serial.println("\n========================================");
+    Serial.println("Voice Control System - Nano 33 BLE Sense");
+    Serial.println("========================================");
+
+    /* Configure GPIO pins */
+    pinMode(LED_BUILTIN, OUTPUT);
+    pinMode(LEDR, OUTPUT);
+    pinMode(LEDG, OUTPUT);
+    pinMode(LEDB, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(FAN_PIN, OUTPUT);
+
+    /* Set initial state - Red LED indicates idle/sleeping */
+    RGB_control(true, false, false);
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(FAN_PIN, LOW);
+    digitalWrite(LED_BUILTIN, LOW);
+
+    /* Display classifier configuration */
+    ei_printf("Classifier settings:\n");
+    ei_printf("  Sample interval: %.2f ms\n", (float)EI_CLASSIFIER_INTERVAL_MS);
+    ei_printf("  Frame size: %d samples\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
+    ei_printf("  Label count: %d\n", EI_CLASSIFIER_LABEL_COUNT);
+    ei_printf("  Inference interval: %d ms\n", INFERENCE_EVERY_MS);
+
+    /* Configure PDM microphone */
+    PDM.onReceive(pdm_data_ready_callback);
+    PDM.setBufferSize(PDM_BUFFER_SIZE);
+    PDM.setGain(127); /* Maximum gain for better sensitivity */
+
+    if (!PDM.begin(1, EI_CLASSIFIER_FREQUENCY)) {
+        ei_printf("ERROR: Failed to start PDM microphone!\n");
+        while (1) {
+            RGB_control(true, false, false);
+            delay(200);
+            RGB_control(false, false, false);
+            delay(200);
+        }
+    }
+
+    ei_printf("System ready. Say 'WAKE' to activate.\n\n");
+
+    /* Startup beep */
+    beep_feedback(100);
+}
+
+/* ============================================================================
+ * MAIN LOOP - Continuous inference and command processing
+ * ============================================================================ */
+
+void loop() {
+    /* Calculate samples needed for desired inference interval */
+    int samples_to_wait = (INFERENCE_EVERY_MS * EI_CLASSIFIER_FREQUENCY) / 1000;
+
+    /* Check if enough samples collected */
+    if (samples_since_last_inference < samples_to_wait) {
+        return;
+    }
+    samples_since_last_inference = 0;
+
+    /* Wait for buffer to fill initially */
+    if (!buffer_filled_once && write_index < EI_CLASSIFIER_RAW_SAMPLE_COUNT) {
+        return;
+    }
+
+    /* ---- Voice Activity Detection ---- */
+    /* Extract recent samples for VAD analysis */
+    int16_t vad_samples[VAD_SAMPLE_SIZE];
+    int start_idx = (write_index - VAD_SAMPLE_SIZE + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
+    for (int i = 0; i < VAD_SAMPLE_SIZE; i++) {
+        vad_samples[i] = ring_buffer[(start_idx + i) % RING_BUFFER_SIZE];
+    }
+
+    bool has_voice = check_vad_enhanced(vad_samples, VAD_SAMPLE_SIZE);
+
+    /* Skip inference if no voice and in idle state (save power) */
+    if (!has_voice && current_state == STATE_IDLE) {
+        /* Periodically reset accumulator during silence */
+        reset_accumulator();
+        return;
+    }
+
+    /* ---- Prepare signal for classifier ---- */
+    signal_t signal;
+    signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
+    signal.get_data = [](size_t offset, size_t length, float* out_ptr) -> int {
+        int read_start = write_index - EI_CLASSIFIER_RAW_SAMPLE_COUNT + offset;
+        if (read_start < 0) read_start += RING_BUFFER_SIZE;
+
+        for (size_t i = 0; i < length; i++) {
+            int idx = (read_start + i) % RING_BUFFER_SIZE;
+            out_ptr[i] = (float)ring_buffer[idx];
+        }
+        return 0;
+    };
+
+    /* ---- Run classifier ---- */
+    ei_impulse_result_t result = {0};
+    EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
+    if (err != EI_IMPULSE_OK) {
+        ei_printf("Classifier error: %d\n", err);
+        return;
+    }
+
+    /* ---- Posterior smoothing ---- */
+    float smoothed[EI_CLASSIFIER_LABEL_COUNT];
+    get_smoothed_posteriors(&result, smoothed);
+
+    /* ---- Find best class from smoothed posteriors ---- */
+    int best_class_idx = -1;
+    float best_smoothed = 0.0f;
+    for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        if (smoothed[i] > best_smoothed) {
+            best_smoothed = smoothed[i];
+            best_class_idx = (int)i;
+        }
+    }
+
+    /* Get label and check if it's noise/unknown */
+    const char* label_str = result.classification[best_class_idx].label;
+    KeywordLabel label = string_to_label(label_str);
+
+    /* ---- FILTER NOISE BEFORE ACCUMULATION ---- */
+    if (label == LABEL_UNKNOWN || label == LABEL_NOISE) {
+        /* Decay accumulator during noise/silence instead of accumulating */
+        for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+            accumulated.scores[i] *= 0.5f; /* Fast decay during noise */
+        }
+        return; /* Skip further processing */
+    }
+
+    /* ---- Confidence accumulation ---- */
+    update_accumulator(smoothed);
+
+    float accumulated_score = 0.0f;
+    best_class_idx = get_best_accumulated_label(&accumulated_score);
+
+    /* Check if accumulated score exceeds threshold */
+    if (best_class_idx < 0 || accumulated_score < ACCUMULATION_THRESHOLD) {
+        /* Not enough confidence yet - check for timeout in listening state */
+        if (current_state == STATE_LISTENING) {
+            unsigned long current_time = millis();
+            if (current_time - last_wake_time > LISTENING_TIMEOUT_MS) {
+                current_state = STATE_IDLE;
+                history_clear();
+                reset_accumulator();
+                reset_posterior_history();
+                RGB_control(true, false, false);
+                ei_printf("--- TIMEOUT: Returning to sleep ---\n");
+            }
+        }
+        return;
+    }
+
+    /* Get label info */
+    label_str = result.classification[best_class_idx].label;
+    label = string_to_label(label_str);
+    float confidence = smoothed[best_class_idx];
+    unsigned long current_time = millis();
+
+    /* Debug output */
+    ei_printf("[%.2f] %s (acc=%.2f, smooth=%.2f)\n", (float)current_time / 1000.0f, label_str, accumulated_score,
+              confidence);
+
+    /* Filter out noise and unknown */
+    if (label == LABEL_UNKNOWN || label == LABEL_NOISE) {
+        return;
+    }
+
+    /* Check confidence threshold */
+    if (confidence < PREDICTION_THRESHOLD) {
+        return;
+    }
+
+    /* Check for duplicate */
+    if (is_duplicate_detection(label, confidence, current_time)) {
+        ei_printf("  -> Skipped (duplicate)\n");
+        return;
+    }
+
+    /* Valid detection - update state and process */
+    update_last_detection(label, confidence, current_time);
+    reset_accumulator();
+    reset_posterior_history();
+
+    ei_printf("  -> DETECTED: %s\n", label_str);
+
+    /* Process through FSM */
+    process_fsm(label, confidence, current_time);
 }
