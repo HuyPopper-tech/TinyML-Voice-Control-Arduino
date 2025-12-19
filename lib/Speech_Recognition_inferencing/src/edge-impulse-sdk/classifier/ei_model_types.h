@@ -109,6 +109,7 @@
 #define EI_CLASSIFIER_MODE_ANOMALY_KMEANS      6
 #define EI_CLASSIFIER_MODE_DSP                 7
 #define EI_CLASSIFIER_MODE_FREEFORM            8
+#define EI_CLASSIFIER_MODE_ANOMALY_CUSTOM      9
 
 #define EI_CLASSIFIER_TYPE_NONE                0
 #define EI_CLASSIFIER_TYPE_CLASSIFICATION      1
@@ -251,6 +252,9 @@ typedef struct {
 typedef struct {
     uint16_t implementation_version;
     uint8_t quant_type;
+    float input_scale;
+    float input_zeropoint;
+    int8_t object_detection_last_layer;
 } ei_config_aton_graph_t;
 
 /** Configuration for the nordic_axon.h */

@@ -46,7 +46,7 @@
 #include "edge-impulse-sdk/classifier/inferencing_engines/engines.h"
 #include "edge-impulse-sdk/classifier/postprocessing/ei_postprocessing_common.h"
 
-const char* ei_classifier_inferencing_categories_822117_1[] = { "FAN", "LED", "OFF", "ON", "WAKE", "_noise", "_unknown" };
+const char* ei_classifier_inferencing_categories_822117_1[] = { "FAN", "LED", "OFF", "ON", "WAKE", "_noise" };
 
 ei_dsp_named_axis_t ei_dsp_config_822117_3_named_axes[] = {
     { .name = "Signal", .axis = 0 }
@@ -61,13 +61,13 @@ ei_dsp_config_mfcc_t ei_dsp_config_822117_3 = {
     ei_dsp_config_822117_3_named_axes, // named axes
     ei_dsp_config_822117_3_named_axes_size, // size of the named axes array
     13, // int num_cepstral
-    0.025f, // float frame_length
-    0.02f, // float frame_stride
+    0.02f, // float frame_length
+    0.016f, // float frame_stride
     32, // int num_filters
     256, // int fft_length
-    101, // int win_size
-    80, // int low_frequency
-    7600, // int high_frequency
+    31, // int win_size
+    100, // int low_frequency
+    8000, // int high_frequency
     0.98f, // float pre_cof
     1 // int pre_shift
 };
@@ -76,7 +76,7 @@ const uint8_t ei_dsp_blocks_822117_1_size = 1;
 ei_model_dsp_t ei_dsp_blocks_822117_1[ei_dsp_blocks_822117_1_size] = {
     { // DSP block 3
         3,
-        637, // output size
+        806, // output size
         &extract_mfcc_features, // DSP function pointer
         (void*)&ei_dsp_config_822117_3, // pointer to config struct
         ei_dsp_config_822117_3_axes, // array of offsets into the input stream, one for each axis
@@ -151,9 +151,9 @@ const ei_impulse_t impulse_822117_1 = {
     .project_name = "Speech Recognition",
     .impulse_id = 1,
     .impulse_name = "Impulse #1",
-    .deploy_version = 9,
+    .deploy_version = 16,
 
-    .nn_input_frame_size = 637,
+    .nn_input_frame_size = 806,
     .raw_sample_count = 16000,
     .raw_samples_per_frame = 1,
     .dsp_input_frame_size = 16000 * 1,
@@ -182,7 +182,7 @@ const ei_impulse_t impulse_822117_1 = {
     .slices_per_model_window = 4,
 
     .has_anomaly = EI_ANOMALY_TYPE_UNKNOWN,
-    .label_count = 7,
+    .label_count = 6,
     .categories = ei_classifier_inferencing_categories_822117_1,
     .results_type = EI_CLASSIFIER_TYPE_CLASSIFICATION,
     .freeform_outputs_size = freeform_outputs_822117_1_size,

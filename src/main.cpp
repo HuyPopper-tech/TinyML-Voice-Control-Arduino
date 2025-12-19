@@ -2,33 +2,34 @@
 /* Supports wake word detection and command execution for LED and FAN control */
 
 #include <Arduino.h>
-#include <PDM.h>  /* Pulse Density Modulation microphone library */
-#include <Speech_Recognition_inferencing.h>  /* Edge Impulse inference library */
+#include <PDM.h>
+#include <Speech_Recognition_inferencing.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-#include <deque>  /* For command history queue */
-#include <string>  /* For string operations */
-#include <vector>  /* For detection results */
+#define MAX_LABEL_LEN                           7
 
 /* Enable quantization for filterbank to optimize memory usage */
-#define EIDSP_QUANTIZE_FILTERBANK    1
+#define EIDSP_QUANTIZE_FILTERBANK               1
 
-/* Perform inference every 300ms for responsive detection */
-#define INFERENCE_EVERY_MS           300
-/* Minimum confidence threshold (70%) to accept a prediction */
-#define PREDICTION_THRESHOLD         0.7f
-/* Timeout period (5 seconds) - system returns to idle if no command received */
-#define LISTENING_TIMEOUT_MS         5000
+/* Perform inference every 200ms for responsive detection */
+#define INFERENCE_EVERY_MS                      200
+/* Minimum confidence threshold (60%) to accept a prediction */
+#define PREDICTION_THRESHOLD                    0.7f
+/* Timeout period (10 seconds) - system returns to idle if no command received */
+#define LISTENING_TIMEOUT_MS                    10000
+#define DEVICE_TIMEOUT_MS                       4000
 
 /* Circular buffer size matching the classifier's required sample count */
-#define RING_BUFFER_SIZE             (EI_CLASSIFIER_RAW_SAMPLE_COUNT)
+#define RING_BUFFER_SIZE                        (2 * EI_CLASSIFIER_RAW_SAMPLE_COUNT)
 
-/* Hardware pin definitions */
-#define BUZZER_PIN                   D2  /* Buzzer for audio feedback */
-#define FAN_PIN                      D3  /* Fan control output */
+/* Hardware pins */
+#define FAN_IN1                       D3
+#define FAN_IN2                       D4
 
 /* Circular buffer for audio samples used by the classifier */
 static int16_t ring_buffer[RING_BUFFER_SIZE];
-/* Current write position in the ring buffer (volatile for ISR access) */
 static volatile int write_index = 0;
 /* Flag indicating if the buffer has wrapped around at least once */
 static volatile bool buffer_filled_once = false;
@@ -38,34 +39,24 @@ static int samples_since_last_inference = 0;
 /* Temporary buffer for PDM microphone data */
 static short sampleBuffer[2048];
 
-/* FSM States */
-enum SystemState {
-    STATE_IDLE,       /* Waiting for wake word */
-    STATE_LISTENING,  /* Active listening for commands */
+/* Finite-state machine states */
+enum SystemState : uint8_t {
+    STATE_IDLE,
+    STATE_WAIT_ACTION,
+    STATE_DEVICE_ON,
+    STATE_DEVICE_OFF
 };
 
 /* Current system state - starts in idle mode */
 SystemState current_state = STATE_IDLE;
 /* Timestamp of last wake word detection or command - used for timeout */
-unsigned long last_wake_time = 0;
-
-/* Structure to hold detected keyword information */
-struct DetectedKeyword {
-    String label;              /* Detected keyword label */
-    unsigned long timestamp;   /* Time of detection */
-    float confidence;          /* Confidence score (0.0 to 1.0) */
-};
-
-/* Structure to store command history for sequence analysis */
-struct CommandHistory {
-    String label;              /* Command label */
-    unsigned long timestamp;   /* Time of detection */
-};
-/* Queue storing recent commands (max 5) for pattern matching */
-std::deque<CommandHistory> active_history;
+static unsigned long last_wake_time = 0;
+static unsigned long last_device_time = 0;
+static char last_label_processed[MAX_LABEL_LEN] = {0};
+static unsigned long last_label_time = 0;
 
 /* FSM processing function - handles state transitions and command execution */
-void process_fsm(std::vector<DetectedKeyword> detections);
+void process_fsm(const char* label, float confidence);
 /* Controls the RGB LED with specified colors (true = on, false = off) */
 void RGB_control(bool red, bool green, bool blue);
 /* Controls the fan motor (true = on, false = off) */
@@ -77,21 +68,20 @@ static void pdm_data_ready_inference_callback(void);
 void setup() {
     /* Initialize serial communication at high baud rate for debugging */
     Serial.begin(921600);
-    while (!Serial);  /* Wait for serial port to connect */
+    while (!Serial); /* Wait for serial port to connect */
 
     Serial.println("Edge Impulse Wake Word Demo (Continuous)");
 
     /* Configure all output pins */
-    pinMode(LED_BUILTIN, OUTPUT);  /* Built-in LED for user control */
-    pinMode(LEDR, OUTPUT);         /* Red LED for status indication */
-    pinMode(LEDG, OUTPUT);         /* Green LED for status indication */
-    pinMode(LEDB, OUTPUT);         /* Blue LED for status indication */
-    pinMode(BUZZER_PIN, OUTPUT);   /* Buzzer for audio feedback */
-    pinMode(FAN_PIN, OUTPUT);      /* Fan control output */
+    pinMode(LED_BUILTIN, OUTPUT); /* Built-in LED for user control */
+    pinMode(LEDR, OUTPUT);        /* Red LED for status indication */
+    pinMode(LEDG, OUTPUT);        /* Green LED for status indication */
+    pinMode(LEDB, OUTPUT);        /* Blue LED for status indication */
+    pinMode(FAN_IN1, OUTPUT);     /* Fan control output */
+    pinMode(FAN_IN2, OUTPUT);     /* Fan control output */
 
     /* Set initial state - Red LED indicates idle/sleeping state */
     RGB_control(true, false, false);
-    digitalWrite(BUZZER_PIN, LOW);  /* Ensure buzzer is off */
 
     /* Display classifier configuration for debugging */
     ei_printf("Inferencing settings:\n");
@@ -99,14 +89,14 @@ void setup() {
     ei_printf("\tFrame size: %d\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
 
     /* Configure PDM microphone */
-    PDM.onReceive(&pdm_data_ready_inference_callback);  /* Set ISR callback */
-    PDM.setBufferSize(2048);  /* Set buffer size for audio samples */
-    if (!PDM.begin(1, EI_CLASSIFIER_FREQUENCY)) {  /* Start PDM with classifier frequency */
+    PDM.onReceive(&pdm_data_ready_inference_callback); /* Set ISR callback */
+    PDM.setBufferSize(2048);                           /* Set buffer size for audio samples */
+    if (!PDM.begin(1, EI_CLASSIFIER_FREQUENCY)) {      /* Start PDM with classifier frequency */
         ei_printf("Failed to start PDM!");
-        while (1);  /* Halt execution on failure */
+        while (1); /* Halt execution on failure */
     }
-    PDM.begin(1, 16000);  /* Mono channel, 16kHz sampling rate */
-    PDM.setGain(127);     /* Set microphone gain to maximum */
+    PDM.begin(1, 16000); /* Mono channel, 16kHz sampling rate */
+    PDM.setGain(80);    /* Set microphone gain to maximum */
 }
 
 /* Main loop - runs continuously performing inference at regular intervals */
@@ -114,9 +104,24 @@ void loop() {
     /* Calculate required samples for the desired inference interval */
     int samples_to_wait = (INFERENCE_EVERY_MS * EI_CLASSIFIER_FREQUENCY) / 1000;
 
+    unsigned long current_time = millis();
+    if (current_state != STATE_IDLE && (current_time - last_wake_time > LISTENING_TIMEOUT_MS)) {
+        current_state = STATE_IDLE;
+        RGB_control(true, false, false);
+        ei_printf("--- Timeout: He thong quay ve IDLE ---\n");
+    }
+
+    if ((current_state == STATE_DEVICE_ON || current_state == STATE_DEVICE_OFF) && 
+        (current_time - last_wake_time > DEVICE_TIMEOUT_MS)) {
+        current_state = STATE_WAIT_ACTION;
+        RGB_control(false, false, true); // LED Xanh dương - Quay lại chờ lệnh ON/OFF
+        ei_printf("--- Timeout thiet bi: Quay ve cho lenh ON/OFF ---\n");
+    }
+    
+
     /* Check if enough samples have been collected for next inference */
     if (samples_since_last_inference >= samples_to_wait) {
-        samples_since_last_inference = 0;  /* Reset counter for next inference */
+        samples_since_last_inference = 0; /* Reset counter for next inference */
 
         /* Wait until we have enough data in the buffer before first inference */
         if (!buffer_filled_once && write_index < EI_CLASSIFIER_RAW_SAMPLE_COUNT) {
@@ -143,13 +148,13 @@ void loop() {
                 int idx = (read_start_index + i) % RING_BUFFER_SIZE;
                 out_ptr[i] = (float)ring_buffer[idx];
             }
-            return 0;  /* Success */
+            return 0; /* Success */
         };
 
         /* Initialize result structure and run classifier */
         ei_impulse_result_t result = {0};
         EI_IMPULSE_ERROR r = run_classifier(&signal, &result, false);
-        if (r != EI_IMPULSE_OK) return;  /* Exit if classifier fails */
+        if (r != EI_IMPULSE_OK) return; /* Exit if classifier fails */
 
         /* Find the classification with highest confidence */
         float max_val = 0;
@@ -161,114 +166,101 @@ void loop() {
                 max_lbl = result.classification[ix].label;
             }
         }
+        ei_printf("(DSP: %d ms., Classification: %d ms., Anomaly: %d ms.)",
+            result.timing.dsp, result.timing.classification, result.timing.anomaly);
+        ei_printf(": \n");
 
-        /* Vector to store valid detections */
-        std::vector<DetectedKeyword> current_detection;
         ei_printf("Debug: %s = %.2f\n", max_lbl, max_val);
 
         /* Filter out low confidence predictions and noise/unknown labels */
-        if (max_val > PREDICTION_THRESHOLD && strcmp(max_lbl, "_unknown") != 0 && strcmp(max_lbl, "_noise") != 0 &&
-            strcmp(max_lbl, "unknown") != 0 && strcmp(max_lbl, "noise") != 0) {
-            /* Add valid detection to vector with timestamp */
-            current_detection.push_back({String(max_lbl), millis(), max_val});
+        if (max_val > PREDICTION_THRESHOLD && strcmp(max_lbl, "_noise") != 0 && strcmp(max_lbl, "noise") != 0) {
             ei_printf("Detected: %s (%.2f)\n", max_lbl, max_val);
+            process_fsm(max_lbl, max_val);
         }
-
-        /* Process detection through finite state machine */
-        process_fsm(current_detection);
     }
 }
 
 /* Finite State Machine processor - handles wake word and command logic */
-void process_fsm(std::vector<DetectedKeyword> detections) {
+void process_fsm(const char* label, float confidence) {
     unsigned long current_time = millis();
 
-    /* Check timeout - if listening state but no command for too long, go to sleep */
-    if (current_state == STATE_LISTENING) {
-        if (current_time - last_wake_time > LISTENING_TIMEOUT_MS) {
-            /* Transition back to idle state */
-            current_state = STATE_IDLE;
-            active_history.clear();  /* Clear command history */
+    /* Step 1: Ignore noise/unknown and suppress repeats (<500 ms) */
+    if (label == "_noise" || label == "_unknown") return;
 
-            /* Red LED: System sleeping */
-            RGB_control(true, false, false);
-            ei_printf("--- TIMEOUT: System Sleep (Waiting for 'hello') ---\n");
-        }
+    /* Debounce: if repeated label within 500ms, ignore duplicates */
+    if (strncmp(label, last_label_processed, MAX_LABEL_LEN) == 0 && (current_time - last_label_time < 500)) {
+        return;
     }
 
-    /* Exit if no detections to process */
-    if (detections.empty()) return;
-    DetectedKeyword d = detections[0];  /* Get the detected keyword */
+    strncpy(last_label_processed, label, MAX_LABEL_LEN - 1);
+    last_label_processed[MAX_LABEL_LEN - 1] = '\0';
+    last_label_time = current_time;
 
-    /* Process FSM based on current state */
+    /* Step 2: Handle states and actions */
+
     switch (current_state) {
-        /* IDLE State - waiting for wake word */
         case STATE_IDLE:
-            /* Only respond to WAKE keyword */
-            if (d.label == "WAKE") {
-                /* Transition to listening state */
-                current_state = STATE_LISTENING;
-                last_wake_time = current_time;  /* Record wake time for timeout */
-
-                /* Blue LED: Awake and listening */
+            if (strcmp(label, "WAKE") == 0) {
+                current_state = STATE_WAIT_ACTION;
+                last_wake_time = current_time;
                 RGB_control(false, false, true);
 
-                /* Provide audio feedback */
-                digitalWrite(BUZZER_PIN, HIGH);
-                delay(500);
-                digitalWrite(BUZZER_PIN, LOW);
-                ei_printf(">>> WAKE WORD DETECTED! ('hello') -> Listening...\n");
+                ei_printf(">>> DA THUC! Cho lenh trong 10 giay...\n");
             }
             break;
 
-        /* LISTENING State - processing commands */
-        case STATE_LISTENING:
-            /* Update timeout timer on each valid detection */
+        case STATE_WAIT_ACTION:
             last_wake_time = current_time;
 
-            /* Add keyword to history buffer (maintains last 5 commands) */
-            active_history.push_back({d.label, d.timestamp});
-            if (active_history.size() > 5) active_history.pop_front();  /* Remove oldest */
-
-            /* Parse command sequence from history */
-            String action = "";  /* Will be ON or OFF */
-            String device = "";  /* Will be LED or FAN */
-
-            /* Analyze recent history to find action-device pairs */
-            for (auto& h : active_history) {
-                /* Only consider keywords from last 2 seconds */
-                if (current_time - h.timestamp > 2000) continue;
-
-                /* Identify action keywords */
-                if (h.label == "ON" || h.label == "OFF")
-                    action = h.label;
-                /* Identify device keywords */
-                else if (h.label == "LED" || h.label == "FAN")
-                    device = h.label;
+            if (strcmp(label, "WAKE") == 0) {
+                ei_printf("... (Van dang nghe) ...\n");
+            } else if (strcmp(label, "ON") == 0) {
+                current_state = STATE_DEVICE_ON;
+                ei_printf("[FSM] ACTION = ON, cho thiet bi...\n");
+            } else if (strcmp(label, "OFF") == 0) {
+                current_state = STATE_DEVICE_OFF;
+                ei_printf("[FSM] ACTION = OFF, cho thiet bi...\n");
             }
+            break;
 
-            /* If we have both action and device, execute command */
-            if (action != "" && device != "") {
-                ei_printf(">>> COMMAND MATCHED: %s %s <<<\n", device.c_str(), action.c_str());
+        case STATE_DEVICE_ON:
+            if (strcmp(label, "WAKE") == 0) {
+                /* keep state */
+            } else if (strcmp(label, "ON") == 0) {
+                /* keep ON */
+            } else if (strcmp(label, "OFF") == 0) {
+                current_state = STATE_DEVICE_OFF;
+                ei_printf("[FSM] Doi ACTION -> OFF\n");
+            } else if (strcmp(label, "LED") == 0) {
+                ei_printf(">>> THUC THI: LED ON <<<\n");
+                digitalWrite(LED_BUILTIN, HIGH);
+                current_state = STATE_WAIT_ACTION;
+            } else if (strcmp(label, "FAN") == 0) {
+                ei_printf(">>> THUC THI: FAN ON <<<\n");
+                fan_control(true);
+                current_state = STATE_WAIT_ACTION;
+            }
+            break;
 
-                /* Green LED: Command executed successfully */
-                RGB_control(false, true, false);
+        case STATE_DEVICE_OFF:
 
-                /* Execute hardware control based on parsed command */
-                if (device == "LED") {
-                    /* Control built-in LED */
-                    digitalWrite(LED_BUILTIN, (action == "ON") ? HIGH : LOW);
-                } else if (device == "FAN") {
-                    /* Control fan motor */
-                    fan_control(action == "ON");
-                }
+            if (strcmp(label, "WAKE") == 0) {
+                /* keep state */
+            } else if (strcmp(label, "OFF") == 0) {
+                /* keep OFF */
+            } else if (strcmp(label, "ON") == 0) {
+                current_state = STATE_DEVICE_ON;
+                ei_printf("[FSM] Doi ACTION -> ON\n");
+            } else if (strcmp(label, "LED") == 0) {
+                ei_printf(">>> THUC THI: LED OFF <<<\n");
+                digitalWrite(LED_BUILTIN, LOW);
 
-                /* Clear history after execution to prevent command repeat */
-                active_history.clear();
+                current_state = STATE_WAIT_ACTION;
+            } else if (strcmp(label, "FAN") == 0) {
+                ei_printf(">>> THUC THI: FAN OFF <<<\n");
+                fan_control(false);
 
-                /* Stay in listening state to accept more commands */
-                delay(500);  /* Brief pause for visual feedback */
-                RGB_control(false, false, true);  /* Return to blue LED */
+                current_state = STATE_WAIT_ACTION;
             }
             break;
     }
@@ -276,7 +268,13 @@ void process_fsm(std::vector<DetectedKeyword> detections) {
 
 /* Fan control function - turns fan motor on or off */
 void fan_control(bool on) {
-    digitalWrite(FAN_PIN, on ? HIGH : LOW);  /* Set fan pin state */
+    if (on) {
+        digitalWrite(FAN_IN1, HIGH);
+        digitalWrite(FAN_IN2, LOW);
+    } else {
+        digitalWrite(FAN_IN1, LOW);
+        digitalWrite(FAN_IN2, LOW);
+    }
 }
 
 /* ISR callback function - called when PDM microphone has new data available */
@@ -291,11 +289,11 @@ static void pdm_data_ready_inference_callback(void) {
     /* Transfer samples from temporary buffer to circular ring buffer */
     for (int i = 0; i < samplesRead; i++) {
         ring_buffer[write_index] = sampleBuffer[i];
-        write_index++;  /* Advance write position */
+        write_index++; /* Advance write position */
         /* Handle circular buffer wraparound */
         if (write_index >= RING_BUFFER_SIZE) {
-            write_index = 0;  /* Wrap to beginning */
-            buffer_filled_once = true;  /* Mark buffer as having valid data */
+            write_index = 0;           /* Wrap to beginning */
+            buffer_filled_once = true; /* Mark buffer as having valid data */
         }
     }
     /* Update sample counter for inference timing */
@@ -305,7 +303,7 @@ static void pdm_data_ready_inference_callback(void) {
 /* RGB LED control function - manages status indication LEDs */
 /* Note: LEDs are active-low (LOW = ON, HIGH = OFF) */
 void RGB_control(bool red, bool green, bool blue) {
-    digitalWrite(LEDR, red ? LOW : HIGH);    /* Control red LED */
-    digitalWrite(LEDG, green ? LOW : HIGH);  /* Control green LED */
-    digitalWrite(LEDB, blue ? LOW : HIGH);   /* Control blue LED */
+    digitalWrite(LEDR, red ? LOW : HIGH);   /* Control red LED */
+    digitalWrite(LEDG, green ? LOW : HIGH); /* Control green LED */
+    digitalWrite(LEDB, blue ? LOW : HIGH);  /* Control blue LED */
 }
