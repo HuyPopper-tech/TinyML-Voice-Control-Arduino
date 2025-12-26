@@ -1,189 +1,221 @@
-/* Voice-controlled IoT system using Edge Impulse speech recognition */
-/* Supports wake word detection and command execution for LED and FAN control */
+/* * COMBINED FIRMWARE
+ * 1. Engine: Edge Impulse SDK Continuous Inference (High Performance DSP)
+ * 2. Logic: Finite State Machine & Voting Mechanism (High Stability)
+ */
 
 #include <Arduino.h>
 #include <PDM.h>
 #include <Speech_Recognition_inferencing.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-#define MAX_LABEL_LEN                                     7
+/* ========== CLASSIFIER CONFIGURATION (From SDK) ==========
+   - EIDSP_QUANTIZE_FILTERBANK: RAM optimization flag
+   - Divides sample window (typically 1000ms) into 5 slices
+   - Each processing handles 200ms of new data (INFERENCE_EVERY_MS = 200)
+*/
+#define EIDSP_QUANTIZE_FILTERBANK   0
+#define EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW 5
 
-/* Enable quantization for filterbank to optimize memory usage */
-#define EIDSP_QUANTIZE_FILTERBANK                         1
-
-/* Perform inference every 200ms for responsive detection */
-#define INFERENCE_EVERY_MS                                200
-/* Minimum confidence threshold (70%) to accept a prediction */
-#define PREDICTION_THRESHOLD                              0.7f
-/* Timeout period (10 seconds) - system returns to idle if no command received */
+/* ========== APPLICATION CONFIGURATION  ========== */
+#define MAX_LABEL_LEN 7
 #define LISTENING_TIMEOUT_MS                              10000
 #define DEVICE_TIMEOUT_MS                                 4000
+#define PREDICTION_HISTORY_SIZE                           5
+#define VOTING_THRESHOLD                                  3
 
-/* Circular buffer size matching the classifier's required sample count */
-#define RING_BUFFER_SIZE                (2 * EI_CLASSIFIER_RAW_SAMPLE_COUNT)
-
-/* Hardware pins */
+/* ========== PIN DEFINITIONS ========== */
 #define FAN_IN1               D3
 #define FAN_IN2               D4
 
-/* Circular buffer for audio samples used by the classifier */
-static int16_t ring_buffer[RING_BUFFER_SIZE];
-static volatile int write_index = 0;
-/* Flag indicating if the buffer has wrapped around at least once */
-static volatile bool buffer_filled_once = false;
-/* Counter tracking samples collected since last inference */
-static int samples_since_last_inference = 0;
+/* ========== AUDIO BUFFER STRUCTURE (From SDK Continuous) ==========
+   Double-buffering structure for continuous inference with PDM input
+*/
 
-/* Temporary buffer for PDM microphone data */
-static short sampleBuffer[2048];
+typedef struct {
+    signed short *buffers[2];
+    unsigned char buf_select;
+    unsigned char buf_ready;
+    unsigned int buf_count;
+    unsigned int n_samples;
+} inference_t;
 
-/* Finite-state machine states */
-enum SystemState : uint8_t { STATE_IDLE, STATE_WAIT_ACTION, STATE_DEVICE_ON, STATE_DEVICE_OFF };
+static inference_t inference;
+static bool record_ready = false;
+static signed short *sampleBuffer;
+static bool debug_nn = false;
 
-/* Current system state - starts in idle mode */
+/* ========== GLOBAL VARIABLES: FSM & VOTING ==========
+   Manages system states, prediction history, and voting mechanism
+*/
+
+enum SystemState : uint8_t { 
+    STATE_IDLE, 
+    STATE_WAIT_ACTION, 
+    STATE_DEVICE_ON, 
+    STATE_DEVICE_OFF 
+};
 SystemState current_state = STATE_IDLE;
-/* Timestamp of last wake word detection or command - used for timeout */
+
 static unsigned long last_wake_time = 0;
-static unsigned long last_device_time = 0;
 static char last_label_processed[MAX_LABEL_LEN] = {0};
 static unsigned long last_label_time = 0;
 
-/* FSM processing function - handles state transitions and command execution */
+static int prediction_history[PREDICTION_HISTORY_SIZE];
+static int history_index = 0;
+static bool history_filled = false;
+
+/* ========== FUNCTION DECLARATIONS ========== */
+
 void process_fsm(const char* label, float confidence);
-/* Controls the RGB LED with specified colors (true = on, false = off) */
 void RGB_control(bool red, bool green, bool blue);
-/* Controls the fan motor (true = on, false = off) */
 void fan_control(bool on);
-/* ISR callback for PDM microphone - fills ring buffer with audio samples */
+static bool microphone_inference_start(uint32_t n_samples);
+static bool microphone_inference_record(void);
+static void microphone_inference_end(void);
+static int microphone_audio_signal_get_data(size_t offset, size_t length, float *out_ptr);
 static void pdm_data_ready_inference_callback(void);
 
-/* System initialization - runs once at startup */
 void setup() {
-    /* Initialize serial communication at high baud rate for debugging */
-    Serial.begin(921600);
-    while (!Serial); /* Wait for serial port to connect */
+    /* Initialize serial communication (115200 baud or 921600 optional) */
+    Serial.begin(115200);
+    while (!Serial);
 
-    Serial.println("Edge Impulse Wake Word Demo (Continuous)");
+    Serial.println("Edge Impulse Continuous + FSM System");
 
-    /* Configure all output pins */
-    pinMode(LED_BUILTIN, OUTPUT); /* Built-in LED for user control */
-    pinMode(LEDR, OUTPUT);        /* Red LED for status indication */
-    pinMode(LEDG, OUTPUT);        /* Green LED for status indication */
-    pinMode(LEDB, OUTPUT);        /* Blue LED for status indication */
-    pinMode(FAN_IN1, OUTPUT);     /* Fan control output */
-    pinMode(FAN_IN2, OUTPUT);     /* Fan control output */
+    /* ===== STEP 1: Configure I/O Pins ===== */
+    pinMode(LED_BUILTIN, OUTPUT);
+    pinMode(LEDR, OUTPUT);
+    pinMode(LEDG, OUTPUT);
+    pinMode(LEDB, OUTPUT);
+    pinMode(FAN_IN1, OUTPUT);
+    pinMode(FAN_IN2, OUTPUT);
 
-    /* Set initial state - Red LED indicates idle/sleeping state */
+    /* Set initial state: Idle (Red LED) */
     RGB_control(true, false, false);
 
-    /* Display classifier configuration for debugging */
+    /* ===== STEP 2: Initialize & Display Model Settings ===== */
     ei_printf("Inferencing settings:\n");
     ei_printf("\tInterval: %.2f ms.\n", (float)EI_CLASSIFIER_INTERVAL_MS);
     ei_printf("\tFrame size: %d\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
+    ei_printf("\tSample length: %d ms.\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT / 16);
+    ei_printf("\tSlices per window: %d\n", EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW);
 
-    /* Configure PDM microphone */
-    PDM.onReceive(&pdm_data_ready_inference_callback); /* Set ISR callback */
-    PDM.setBufferSize(2048);                           /* Set buffer size for audio samples */
-    if (!PDM.begin(1, EI_CLASSIFIER_FREQUENCY)) {      /* Start PDM with classifier frequency */
-        ei_printf("Failed to start PDM!");
-        while (1); /* Halt execution on failure */
+    run_classifier_init();
+
+    /* ===== STEP 3: Initialize Microphone (Slice-based Continuous) =====
+       Slice size = Total samples / 4 (e.g., 16000 / 4 = 4000 samples = 250ms)
+    */
+    if (microphone_inference_start(EI_CLASSIFIER_SLICE_SIZE) == false) {
+        ei_printf("ERR: Could not allocate audio buffer!\r\n");
+        return;
     }
-    PDM.begin(1, 16000); /* Mono channel, 16kHz sampling rate */
-    PDM.setGain(127);    /* Set microphone gain to maximum */
 }
 
-/* Main loop - runs continuously performing inference at regular intervals */
 void loop() {
-    /* Calculate required samples for the desired inference interval */
-    int samples_to_wait = (INFERENCE_EVERY_MS * EI_CLASSIFIER_FREQUENCY) / 1000;
+    /* ===== SECTION 1: CONTINUOUS AUDIO PROCESSING =====
+       Records microphone data in slices (blocks until 250ms collected)
+       Each iteration processes one new slice of audio data
+    */
+    bool m = microphone_inference_record();
+    if (!m) {
+        ei_printf("ERR: Failed to record audio...\n");
+        return;
+    }
 
+    signal_t signal;
+    signal.total_length = EI_CLASSIFIER_SLICE_SIZE;
+    /* get_data callback: SDK uses this to concatenate new data with previous data */
+    signal.get_data = &microphone_audio_signal_get_data; 
+    ei_impulse_result_t result = {0};
+
+    /* Run classifier in CONTINUOUS (Stateful) mode
+       Automatically handles sliding window overlap across slices
+    */
+    EI_IMPULSE_ERROR r = run_classifier_continuous(&signal, &result, debug_nn);
+    if (r != EI_IMPULSE_OK) {
+        ei_printf("ERR: Failed to run classifier (%d)\n", r);
+        return;
+    }
+
+    /* ===== SECTION 2: TIMEOUT HANDLING (Checked every loop) ===== */
     unsigned long current_time = millis();
+    
+    /* Return to IDLE if listening timeout exceeded */
     if (current_state != STATE_IDLE && (current_time - last_wake_time > LISTENING_TIMEOUT_MS)) {
         current_state = STATE_IDLE;
         RGB_control(true, false, false);
-        ei_printf("--- Timeout: He thong quay ve IDLE ---\n");
+        ei_printf("--- Timeout: Return to IDLE ---\n");
     }
 
+    /* Return to wait for action if device timeout exceeded */
     if ((current_state == STATE_DEVICE_ON || current_state == STATE_DEVICE_OFF) &&
         (current_time - last_wake_time > DEVICE_TIMEOUT_MS)) {
         current_state = STATE_WAIT_ACTION;
-        RGB_control(false, false, true);  // LED Xanh dương - Quay lại chờ lệnh ON/OFF
-        ei_printf("--- Timeout thiet bi: Quay ve cho lenh ON/OFF ---\n");
+        RGB_control(false, false, true);
+        ei_printf("--- Device Timeout: Return to WAIT_ACTION ---\n");
     }
 
-    /* Check if enough samples have been collected for next inference */
-    if (samples_since_last_inference >= samples_to_wait) {
-        samples_since_last_inference = 0; /* Reset counter for next inference */
+    /* ===== SECTION 3: RESULT PROCESSING & VOTING MECHANISM =====
+       Find the label with highest confidence score in this inference cycle
+    */
+    int best_idx = -1;
+    float best_val = 0;
+    
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+        if (result.classification[ix].value > best_val) {
+            best_val = result.classification[ix].value;
+            best_idx = ix;
+        }
+    }
 
-        /* Wait until we have enough data in the buffer before first inference */
-        if (!buffer_filled_once && write_index < EI_CLASSIFIER_RAW_SAMPLE_COUNT) {
-            return;
+    /* Push current prediction into circular history buffer */
+    prediction_history[history_index] = best_idx;
+    history_index++;
+    if (history_index >= PREDICTION_HISTORY_SIZE) {
+        history_index = 0;
+        history_filled = true;
+    }
+
+    /* Voting mechanism: Count occurrences and find consensus */
+    if (history_filled) {
+        int counts[EI_CLASSIFIER_LABEL_COUNT] = {0};
+        for (int i = 0; i < PREDICTION_HISTORY_SIZE; i++) {
+            counts[prediction_history[i]]++;
         }
 
-        /* Prepare signal structure for classifier */
-        signal_t signal;
-        signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
-
-        /* Lambda function to read data from circular buffer */
-        signal.get_data = [](size_t offset, size_t length, float* out_ptr) -> int {
-            /* Calculate starting read position (most recent samples) */
-            int read_start_index = write_index - EI_CLASSIFIER_RAW_SAMPLE_COUNT + offset;
-
-            /* Handle circular buffer wraparound */
-            if (read_start_index < 0)
-                read_start_index += RING_BUFFER_SIZE;
-            else if (read_start_index >= RING_BUFFER_SIZE)
-                read_start_index -= RING_BUFFER_SIZE;
-
-            /* Copy samples from ring buffer to output, converting to float */
-            for (size_t i = 0; i < length; i++) {
-                int idx = (read_start_index + i) % RING_BUFFER_SIZE;
-                out_ptr[i] = (float)ring_buffer[idx];
-            }
-            return 0; /* Success */
-        };
-
-        /* Initialize result structure and run classifier */
-        ei_impulse_result_t result = {0};
-        EI_IMPULSE_ERROR r = run_classifier(&signal, &result, false);
-        if (r != EI_IMPULSE_OK) return; /* Exit if classifier fails */
-
-        /* Find the classification with highest confidence */
-        float max_val = 0;
-        const char* max_lbl = "_unknown";
-
-        for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-            if (result.classification[ix].value > max_val) {
-                max_val = result.classification[ix].value;
-
-                max_lbl = result.classification[ix].label;
+        int winner_idx = -1;
+        for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+            if (counts[i] >= VOTING_THRESHOLD) {
+                winner_idx = i;
+                break; 
             }
         }
 
-        ei_printf("(DSP: %d ms., Classification: %d ms., Anomaly: %d ms.)", result.timing.dsp,
-                  result.timing.classification, result.timing.anomaly);
-        ei_printf(": \n");
+        if (winner_idx >= 0) {
+            const char* winner_label = result.classification[winner_idx].label;
+            float winner_score = result.classification[winner_idx].value;
 
-        ei_printf("Debug: %s = %.2f\n", max_lbl, max_val);
+            /* Light debug output: show inference timing and voting result */
+            ei_printf("(DSP: %d ms., Classification: %d ms., Anomaly: %d ms.)",
+                result.timing.dsp, result.timing.classification, result.timing.anomaly);
+            ei_printf(": \n");
+            ei_printf("Winner: %s (%d/%d)\n", winner_label, counts[winner_idx], PREDICTION_HISTORY_SIZE);
 
-        /* Filter out low confidence predictions and noise/unknown labels */
-        if (max_val > PREDICTION_THRESHOLD && strcmp(max_lbl, "_noise") != 0 && strcmp(max_lbl, "_unknown") != 0) {
-            ei_printf("Detected: %s (%.2f)\n", max_lbl, max_val);
-            process_fsm(max_lbl, max_val);
+            /* Filter out noise and unknown labels before FSM processing */
+            if (strcmp(winner_label, "_noise") != 0 && strcmp(winner_label, "_unknown") != 0) {
+                    process_fsm(winner_label, winner_score);
+            }
         }
     }
 }
 
-/* Finite State Machine processor - handles wake word and command logic */
+/* ========== FINITE STATE MACHINE (FSM) LOGIC ==========
+   Processes recognized labels and manages system state transitions
+   States: IDLE -> WAIT_ACTION -> (DEVICE_ON or DEVICE_OFF) -> WAIT_ACTION -> IDLE
+*/
 void process_fsm(const char* label, float confidence) {
     unsigned long current_time = millis();
 
-    /* Step 1: Ignore noise/unknown and suppress repeats (<500 ms) */
-    if (label == "_noise" || label == "_unknown") return;
-
-    /* Debounce: if repeated label within 500ms, ignore duplicates */
+    /* Debounce: Prevent rapid repeated commands (<500ms interval) */
     if (strncmp(label, last_label_processed, MAX_LABEL_LEN) == 0 && (current_time - last_label_time < 500)) {
         return;
     }
@@ -192,77 +224,76 @@ void process_fsm(const char* label, float confidence) {
     last_label_processed[MAX_LABEL_LEN - 1] = '\0';
     last_label_time = current_time;
 
-    /* Step 2: Handle states and actions */
-
     switch (current_state) {
         case STATE_IDLE:
+            /* In IDLE state: Only WAKE command transitions to WAIT_ACTION */
             if (strcmp(label, "WAKE") == 0) {
                 current_state = STATE_WAIT_ACTION;
                 last_wake_time = current_time;
                 RGB_control(false, false, true);
-
-                ei_printf(">>> DA THUC! Cho lenh trong 10 giay...\n");
+                ei_printf(">>> WOKEN UP! Waiting for command...\n");
             }
             break;
 
         case STATE_WAIT_ACTION:
+            /* In WAIT_ACTION state: Accept ON/OFF commands; reset timeout on any command */
             last_wake_time = current_time;
-
-            if (strcmp(label, "WAKE") == 0) {
-                ei_printf("... (Van dang nghe) ...\n");
-            } else if (strcmp(label, "ON") == 0) {
+            if (strcmp(label, "ON") == 0) {
                 current_state = STATE_DEVICE_ON;
-                ei_printf("[FSM] ACTION = ON, cho thiet bi...\n");
+                ei_printf("[FSM] ACTION = ON, awaiting device...\n");
             } else if (strcmp(label, "OFF") == 0) {
                 current_state = STATE_DEVICE_OFF;
-                ei_printf("[FSM] ACTION = OFF, cho thiet bi...\n");
+                ei_printf("[FSM] ACTION = OFF, awaiting device...\n");
             }
             break;
 
         case STATE_DEVICE_ON:
-            if (strcmp(label, "WAKE") == 0) {
-                /* keep state */
-            } else if (strcmp(label, "ON") == 0) {
-                /* keep ON */
-            } else if (strcmp(label, "OFF") == 0) {
-                current_state = STATE_DEVICE_OFF;
-                ei_printf("[FSM] Doi ACTION -> OFF\n");
+            /* In DEVICE_ON state: Execute ON commands for devices (LED/FAN) or switch to OFF */
+            if (strcmp(label, "OFF") == 0) {
+                 current_state = STATE_DEVICE_OFF; 
+                 ei_printf("[FSM] Switch to OFF mode\n");
             } else if (strcmp(label, "LED") == 0) {
-                ei_printf(">>> THUC THI: LED ON <<<\n");
+                ei_printf(">>> EXECUTING: LED ON <<<\n");
                 digitalWrite(LED_BUILTIN, HIGH);
                 current_state = STATE_WAIT_ACTION;
             } else if (strcmp(label, "FAN") == 0) {
-                ei_printf(">>> THUC THI: FAN ON <<<\n");
+                ei_printf(">>> EXECUTING: FAN ON <<<\n");
                 fan_control(true);
                 current_state = STATE_WAIT_ACTION;
             }
             break;
 
         case STATE_DEVICE_OFF:
-
-            if (strcmp(label, "WAKE") == 0) {
-                /* keep state */
-            } else if (strcmp(label, "OFF") == 0) {
-                /* keep OFF */
-            } else if (strcmp(label, "ON") == 0) {
-                current_state = STATE_DEVICE_ON;
-                ei_printf("[FSM] Doi ACTION -> ON\n");
+            /* In DEVICE_OFF state: Execute OFF commands for devices (LED/FAN) or switch to ON */
+            if (strcmp(label, "ON") == 0) {
+                 current_state = STATE_DEVICE_ON;
+                 ei_printf("[FSM] Switch to ON mode\n");
             } else if (strcmp(label, "LED") == 0) {
-                ei_printf(">>> THUC THI: LED OFF <<<\n");
+                ei_printf(">>> EXECUTING: LED OFF <<<\n");
                 digitalWrite(LED_BUILTIN, LOW);
-
                 current_state = STATE_WAIT_ACTION;
             } else if (strcmp(label, "FAN") == 0) {
-                ei_printf(">>> THUC THI: FAN OFF <<<\n");
+                ei_printf(">>> EXECUTING: FAN OFF <<<\n");
                 fan_control(false);
-
                 current_state = STATE_WAIT_ACTION;
             }
             break;
     }
 }
 
-/* Fan control function - turns fan motor on or off */
+/* ========== HARDWARE CONTROL FUNCTIONS ========== */
+
+/* Control RGB LED: Active-low logic (LOW = ON, HIGH = OFF) */
+void RGB_control(bool red, bool green, bool blue) {
+    digitalWrite(LEDR, red ? LOW : HIGH);
+    digitalWrite(LEDG, green ? LOW : HIGH);
+    digitalWrite(LEDB, blue ? LOW : HIGH);
+}
+
+/* Control DC fan motor via dual-input H-bridge
+   ON: FAN_IN1=HIGH, FAN_IN2=LOW (forward rotation)
+   OFF: Both LOW (motor disabled)
+*/
 void fan_control(bool on) {
     if (on) {
         digitalWrite(FAN_IN1, HIGH);
@@ -273,33 +304,123 @@ void fan_control(bool on) {
     }
 }
 
-/* ISR callback function - called when PDM microphone has new data available */
-static void pdm_data_ready_inference_callback(void) {
-    /* Check how many bytes are available from the microphone */
-    int bytesAvailable = PDM.available();
-    /* Read audio data into temporary buffer */
-    int bytesRead = PDM.read((char*)&sampleBuffer[0], bytesAvailable);
-    /* Calculate number of samples (each sample is 2 bytes/16-bit) */
-    int samplesRead = bytesRead / 2;
+/* ========== AUDIO PROCESSING FUNCTIONS (From SDK) ==========
+   These functions manage double-buffering for continuous inference
+   PDM data flows into buffers that are alternately filled and processed
+*/
 
-    /* Transfer samples from temporary buffer to circular ring buffer */
-    for (int i = 0; i < samplesRead; i++) {
-        ring_buffer[write_index] = sampleBuffer[i];
-        write_index++; /* Advance write position */
-        /* Handle circular buffer wraparound */
-        if (write_index >= RING_BUFFER_SIZE) {
-            write_index = 0;           /* Wrap to beginning */
-            buffer_filled_once = true; /* Mark buffer as having valid data */
+/* PDM Data Ready Callback (ISR)
+   Executes when PDM microphone has new audio data available
+   - Reads raw PDM samples into temporary buffer
+   - Transfers to active inference buffer
+   - Toggles buffers when one is filled (double-buffering)
+*/
+static void pdm_data_ready_inference_callback(void) {
+    int bytesAvailable = PDM.available();
+    /* Read available PDM data into temporary sample buffer */
+    int bytesRead = PDM.read((char *)&sampleBuffer[0], bytesAvailable);
+
+    if (record_ready == true) {
+        for (int i = 0; i < bytesRead >> 1; i++) {
+            /* Push sample into current inference buffer */
+            inference.buffers[inference.buf_select][inference.buf_count++] = sampleBuffer[i];
+
+            if (inference.buf_count >= inference.n_samples) {
+                /* Buffer full: Toggle to other buffer, signal ready slice */
+                inference.buf_select ^= 1;
+                inference.buf_count = 0;
+                inference.buf_ready = 1;
+            }
         }
     }
-    /* Update sample counter for inference timing */
-    samples_since_last_inference += samplesRead;
 }
 
-/* RGB LED control function - manages status indication LEDs */
-/* Note: LEDs are active-low (LOW = ON, HIGH = OFF) */
-void RGB_control(bool red, bool green, bool blue) {
-    digitalWrite(LEDR, red ? LOW : HIGH);   /* Control red LED */
-    digitalWrite(LEDG, green ? LOW : HIGH); /* Control green LED */
-    digitalWrite(LEDB, blue ? LOW : HIGH);  /* Control blue LED */
+/* Initialize microphone with double-buffering
+   Allocates two buffers (n_samples each) for alternating use
+   Parameters:
+   - n_samples: Size of each inference buffer (typically 4000 = 250ms @ 16kHz)
+*/
+static bool microphone_inference_start(uint32_t n_samples) {
+    /* Allocate first buffer for alternating inference */
+    inference.buffers[0] = (signed short *)malloc(n_samples * sizeof(signed short));
+    if (inference.buffers[0] == NULL) return false;
+
+    /* Allocate second buffer for alternating inference */
+    inference.buffers[1] = (signed short *)malloc(n_samples * sizeof(signed short));
+    if (inference.buffers[1] == NULL) {
+        free(inference.buffers[0]);
+        return false;
+    }
+
+    /* Allocate temporary sample buffer (half size due to PDM byte reading) */
+    sampleBuffer = (signed short *)malloc((n_samples >> 1) * sizeof(signed short));
+    if (sampleBuffer == NULL) {
+        free(inference.buffers[0]);
+        free(inference.buffers[1]);
+        return false;
+    }
+
+    /* Initialize inference state variables */
+    inference.buf_select = 0;
+    inference.buf_count = 0;
+    inference.n_samples = n_samples;
+    inference.buf_ready = 0;
+
+    /* Register PDM data ready callback (ISR) */
+    PDM.onReceive(&pdm_data_ready_inference_callback);
+    
+    /* Configure PDM buffer size based on slice size (n_samples) */
+    PDM.setBufferSize((n_samples >> 1) * sizeof(int16_t));
+
+    /* Start PDM microphone at configured frequency */
+    if (!PDM.begin(1, EI_CLASSIFIER_FREQUENCY)) {
+        ei_printf("Failed to start PDM!");
+        return false;
+    }
+    
+    PDM.setGain(127);
+    record_ready = true;
+    return true;
+}
+
+/* Wait for microphone buffer to fill (blocking until next slice ready)
+   - Blocks main loop until one slice of audio is collected
+   - PDM ISR continues in background, filling buffer
+   - Approximately 250ms wait per call
+*/
+static bool microphone_inference_record(void) {
+    bool ret = true;
+    if (inference.buf_ready == 1) {
+        ei_printf("Error sample buffer overrun.\n");
+        ret = false;
+    }
+
+    /* Block until PDM ISR signals buffer ready (next slice collected) */
+    while (inference.buf_ready == 0) {
+        delay(1);
+    }
+
+    inference.buf_ready = 0;
+    return ret;
+}
+
+/* Convert audio data from int16 to float for classifier input
+   Uses the non-active buffer (XOR toggles between 0 and 1)
+   Parameters:
+   - offset: Start position in buffer
+   - length: Number of samples to convert
+   - out_ptr: Output float array
+*/
+static int microphone_audio_signal_get_data(size_t offset, size_t length, float *out_ptr) {
+    /* Convert int16 samples to float from inactive buffer for DSP processing */
+    numpy::int16_to_float(&inference.buffers[inference.buf_select ^ 1][offset], out_ptr, length);
+    return 0;
+}
+
+/* Cleanup and deallocate microphone resources */
+static void microphone_inference_end(void) {
+    PDM.end();
+    free(inference.buffers[0]);
+    free(inference.buffers[1]);
+    free(sampleBuffer);
 }

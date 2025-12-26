@@ -61,14 +61,14 @@ ei_dsp_config_mfcc_t ei_dsp_config_822117_3 = {
     ei_dsp_config_822117_3_named_axes, // named axes
     ei_dsp_config_822117_3_named_axes_size, // size of the named axes array
     13, // int num_cepstral
-    0.02f, // float frame_length
-    0.016f, // float frame_stride
+    0.03f, // float frame_length
+    0.015f, // float frame_stride
     32, // int num_filters
     256, // int fft_length
-    31, // int win_size
+    101, // int win_size
     100, // int low_frequency
-    8000, // int high_frequency
-    0.98f, // float pre_cof
+    0, // int high_frequency
+    0.97f, // float pre_cof
     1 // int pre_shift
 };
 
@@ -76,7 +76,7 @@ const uint8_t ei_dsp_blocks_822117_1_size = 1;
 ei_model_dsp_t ei_dsp_blocks_822117_1[ei_dsp_blocks_822117_1_size] = {
     { // DSP block 3
         3,
-        806, // output size
+        845, // output size
         &extract_mfcc_features, // DSP function pointer
         (void*)&ei_dsp_config_822117_3, // pointer to config struct
         ei_dsp_config_822117_3_axes, // array of offsets into the input stream, one for each axis
@@ -151,9 +151,9 @@ const ei_impulse_t impulse_822117_1 = {
     .project_name = "Speech Recognition",
     .impulse_id = 1,
     .impulse_name = "Impulse #1",
-    .deploy_version = 16,
+    .deploy_version = 21,
 
-    .nn_input_frame_size = 806,
+    .nn_input_frame_size = 845,
     .raw_sample_count = 16000,
     .raw_samples_per_frame = 1,
     .dsp_input_frame_size = 16000 * 1,
