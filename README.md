@@ -12,7 +12,7 @@ The project demonstrates the capability of running complex deep learning models 
 
       * Utilizes a **DS-CNN (Depthwise Separable Convolutional Neural Network)** architecture optimized for embedded devices.
       * **Int8 Quantization:** The model is quantized to 8-bit integers to minimize memory usage (Flash/RAM) while maintaining high accuracy.
-      * **Fast Inference:** Achieves an inference time of approximately **35ms** on the Cortex-M4F processor.
+      * **Fast Inference:** Achieves an inference time of approximately **48ms** on the Cortex-M4F processor.
 
   * **Robust Post-Processing:**
 
@@ -102,7 +102,7 @@ Once the system is running, the Serial Monitor will display the initialization s
 | **Model Architecture** | DS-CNN | Depthwise Separable CNN |
 | **Input Features** | MFCC | Mel-Frequency Cepstral Coefficients |
 | **Quantization** | Int8 | Optimized for MCU |
-| **Flash Usage** | \~81 KB | Model weights + Program code |
-| **RAM Usage** | \~22.8 KB | Tensor Arena + Audio Buffers |
-| **Inference Time** | \~35 ms | Per window |
+| **Flash Usage** | \~161 KB | Model weights + Program code |
+| **RAM Usage** | \~58.8 KB | Tensor Arena + Audio Buffers |
+| **Inference Time** | \~48 ms | Per window |
 
