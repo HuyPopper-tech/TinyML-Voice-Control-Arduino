@@ -1,0 +1,7 @@
+.vscode/
+.pio/
+sdkconfig.h
+sdkconfig
+CMakeLists.txt
+examples/CMakeLists.txt
+sdkconfig.*

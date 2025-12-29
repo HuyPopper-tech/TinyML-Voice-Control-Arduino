@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <PDM.h>
 #include <Speech_Recognition_inferencing.h>
+#include "DYPlayerArduino.h"
 
 /* ========== CLASSIFIER CONFIGURATION (From SDK) ==========
    - EIDSP_QUANTIZE_FILTERBANK: RAM optimization flag
@@ -43,6 +44,8 @@ static bool record_ready = false;
 static signed short *sampleBuffer;
 static bool debug_nn = false;
 
+DY::Player player(&Serial1);
+
 /* ========== GLOBAL VARIABLES: FSM & VOTING ==========
    Manages system states, prediction history, and voting mechanism
 */
@@ -77,7 +80,8 @@ static void pdm_data_ready_inference_callback(void);
 void setup() {
     /* Initialize serial communication (115200 baud or 921600 optional) */
     Serial.begin(115200);
-    while (!Serial);
+    while(!Serial);
+    Serial1.begin(9600);
 
     Serial.println("Edge Impulse Continuous + FSM System");
 
@@ -108,6 +112,8 @@ void setup() {
         ei_printf("ERR: Could not allocate audio buffer!\r\n");
         return;
     }
+    player.begin();
+    player.setVolume(25);
 }
 
 void loop() {
@@ -232,6 +238,7 @@ void process_fsm(const char* label, float confidence) {
                 last_wake_time = current_time;
                 RGB_control(false, false, true);
                 ei_printf(">>> WOKEN UP! Waiting for command...\n");
+                player.playSpecified(1);                            /* Play WAKE sound */
             }
             break;
 
@@ -255,10 +262,12 @@ void process_fsm(const char* label, float confidence) {
             } else if (strcmp(label, "LED") == 0) {
                 ei_printf(">>> EXECUTING: LED ON <<<\n");
                 digitalWrite(LED_BUILTIN, HIGH);
+                player.playSpecified(2);                        /* Play LED ON sound */
                 current_state = STATE_WAIT_ACTION;
             } else if (strcmp(label, "FAN") == 0) {
                 ei_printf(">>> EXECUTING: FAN ON <<<\n");
                 fan_control(true);
+                player.playSpecified(4);                        /* Play FAN ON sound */
                 current_state = STATE_WAIT_ACTION;
             }
             break;
@@ -271,10 +280,12 @@ void process_fsm(const char* label, float confidence) {
             } else if (strcmp(label, "LED") == 0) {
                 ei_printf(">>> EXECUTING: LED OFF <<<\n");
                 digitalWrite(LED_BUILTIN, LOW);
+                player.playSpecified(3);                        /* Play LED OFF sound */
                 current_state = STATE_WAIT_ACTION;
             } else if (strcmp(label, "FAN") == 0) {
                 ei_printf(">>> EXECUTING: FAN OFF <<<\n");
                 fan_control(false);
+                player.playSpecified(5);                        /* Play FAN OFF sound */
                 current_state = STATE_WAIT_ACTION;
             }
             break;

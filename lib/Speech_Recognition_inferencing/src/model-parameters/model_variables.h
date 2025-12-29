@@ -151,7 +151,7 @@ const ei_impulse_t impulse_822117_1 = {
     .project_name = "Speech Recognition",
     .impulse_id = 1,
     .impulse_name = "Impulse #1",
-    .deploy_version = 21,
+    .deploy_version = 22,
 
     .nn_input_frame_size = 845,
     .raw_sample_count = 16000,
