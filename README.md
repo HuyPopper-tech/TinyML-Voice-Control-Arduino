@@ -35,7 +35,7 @@ The project demonstrates the capability of running complex deep learning models 
 ### Software & Tools
 
   * **Development Environment:** [VS Code](https://code.visualstudio.com/) with [PlatformIO IDE](https://platformio.org/).
-  * **ML Platform:** [Edge Impulse](https://www.edgeimpulse.com/) (for data acquisition, MFCC feature extraction, and model training).
+  * **ML Platform:** [Edge Impulse](https://studio.edgeimpulse.com/public/822117/live) (for data acquisition, MFCC feature extraction, and model training).
   * **Inference Engine:** TensorFlow Lite for Microcontrollers (TFLite Micro).
   * **Framework:** Arduino (mbed OS).
 
@@ -79,7 +79,7 @@ The project demonstrates the capability of running complex deep learning models 
 5.  **Monitor Output:**
 
       * Click the **PlatformIO: Serial Monitor** button (plug icon).
-      * Set the baud rate to `115200` if not automatically detected.
+      * Set the baud rate to `921600` if not automatically detected.
 
 ## Usage Example
 
@@ -103,6 +103,6 @@ Once the system is running, the Serial Monitor will display the initialization s
 | **Input Features** | MFCC | Mel-Frequency Cepstral Coefficients |
 | **Quantization** | Int8 | Optimized for MCU |
 | **Flash Usage** | \~161 KB | Model weights + Program code |
-| **RAM Usage** | \~58.8 KB | Tensor Arena + Audio Buffers |
+| **RAM Usage** | \~82.9 KB | Tensor Arena + Audio Buffers + Dynamic RAM |
 | **Inference Time** | \~48 ms | Per window |
 
