@@ -6,18 +6,18 @@
 #include <Arduino.h>
 #include <PDM.h>
 #include <Speech_Recognition_inferencing.h>
-#include "DYPlayerArduino.h"
+#include "mbed.h"
 
 /* ========== CLASSIFIER CONFIGURATION (From SDK) ==========
    - EIDSP_QUANTIZE_FILTERBANK: RAM optimization flag
    - Divides sample window (typically 1000ms) into 5 slices
    - Each processing handles 200ms of new data (INFERENCE_EVERY_MS = 200)
 */
-#define EIDSP_QUANTIZE_FILTERBANK   0
-#define EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW 5
+#define EIDSP_QUANTIZE_FILTERBANK                 0
+#define EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW     5
 
 /* ========== APPLICATION CONFIGURATION  ========== */
-#define MAX_LABEL_LEN 7
+#define MAX_LABEL_LEN                                     6
 #define LISTENING_TIMEOUT_MS                              10000
 #define DEVICE_TIMEOUT_MS                                 4000
 #define PREDICTION_HISTORY_SIZE                           5
@@ -30,12 +30,11 @@
 /* ========== AUDIO BUFFER STRUCTURE (From SDK Continuous) ==========
    Double-buffering structure for continuous inference with PDM input
 */
-
 typedef struct {
     signed short *buffers[2];
-    unsigned char buf_select;
-    unsigned char buf_ready;
-    unsigned int buf_count;
+    volatile unsigned char buf_select;
+    volatile unsigned char buf_ready;
+    volatile unsigned int buf_count;
     unsigned int n_samples;
 } inference_t;
 
@@ -43,8 +42,6 @@ static inference_t inference;
 static bool record_ready = false;
 static signed short *sampleBuffer;
 static bool debug_nn = false;
-
-DY::Player player(&Serial1);
 
 /* ========== GLOBAL VARIABLES: FSM & VOTING ==========
    Manages system states, prediction history, and voting mechanism
@@ -76,12 +73,11 @@ static bool microphone_inference_record(void);
 static void microphone_inference_end(void);
 static int microphone_audio_signal_get_data(size_t offset, size_t length, float *out_ptr);
 static void pdm_data_ready_inference_callback(void);
+void print_memory_usage(void);
 
 void setup() {
     /* Initialize serial communication (115200 baud or 921600 optional) */
-    Serial.begin(115200);
-    while(!Serial);
-    Serial1.begin(9600);
+    Serial.begin(921600);
 
     Serial.println("Edge Impulse Continuous + FSM System");
 
@@ -106,19 +102,18 @@ void setup() {
     run_classifier_init();
 
     /* ===== STEP 3: Initialize Microphone (Slice-based Continuous) =====
-       Slice size = Total samples / 4 (e.g., 16000 / 4 = 4000 samples = 250ms)
+       Slice size = Total samples / 5 (e.g., 16000 / 5 = 3200 samples = 200ms)
     */
     if (microphone_inference_start(EI_CLASSIFIER_SLICE_SIZE) == false) {
         ei_printf("ERR: Could not allocate audio buffer!\r\n");
         return;
     }
-    player.begin();
-    player.setVolume(25);
+    print_memory_usage();
 }
 
 void loop() {
     /* ===== SECTION 1: CONTINUOUS AUDIO PROCESSING =====
-       Records microphone data in slices (blocks until 250ms collected)
+       Records microphone data in slices (blocks until 200ms collected)
        Each iteration processes one new slice of audio data
     */
     bool m = microphone_inference_record();
@@ -204,6 +199,7 @@ void loop() {
             ei_printf("(DSP: %d ms., Classification: %d ms., Anomaly: %d ms.)",
                 result.timing.dsp, result.timing.classification, result.timing.anomaly);
             ei_printf(": \n");
+            print_memory_usage();
             ei_printf("Winner: %s (%d/%d)\n", winner_label, counts[winner_idx], PREDICTION_HISTORY_SIZE);
 
             /* Filter out noise and unknown labels before FSM processing */
@@ -238,7 +234,6 @@ void process_fsm(const char* label, float confidence) {
                 last_wake_time = current_time;
                 RGB_control(false, false, true);
                 ei_printf(">>> WOKEN UP! Waiting for command...\n");
-                player.playSpecified(1);                            /* Play WAKE sound */
             }
             break;
 
@@ -255,41 +250,51 @@ void process_fsm(const char* label, float confidence) {
             break;
 
         case STATE_DEVICE_ON:
-            /* In DEVICE_ON state: Execute ON commands for devices (LED/FAN) or switch to OFF */
-            if (strcmp(label, "OFF") == 0) {
-                 current_state = STATE_DEVICE_OFF; 
-                 ei_printf("[FSM] Switch to OFF mode\n");
-            } else if (strcmp(label, "LED") == 0) {
+            /* In DEVICE_ON state: Execute ON commands for devices (LED/FAN) */
+            if (strcmp(label, "LED") == 0) {
                 ei_printf(">>> EXECUTING: LED ON <<<\n");
                 digitalWrite(LED_BUILTIN, HIGH);
-                player.playSpecified(2);                        /* Play LED ON sound */
                 current_state = STATE_WAIT_ACTION;
             } else if (strcmp(label, "FAN") == 0) {
                 ei_printf(">>> EXECUTING: FAN ON <<<\n");
                 fan_control(true);
-                player.playSpecified(4);                        /* Play FAN ON sound */
                 current_state = STATE_WAIT_ACTION;
             }
             break;
 
         case STATE_DEVICE_OFF:
-            /* In DEVICE_OFF state: Execute OFF commands for devices (LED/FAN) or switch to ON */
-            if (strcmp(label, "ON") == 0) {
-                 current_state = STATE_DEVICE_ON;
-                 ei_printf("[FSM] Switch to ON mode\n");
-            } else if (strcmp(label, "LED") == 0) {
+            /* In DEVICE_OFF state: Execute OFF commands for devices (LED/FAN) */
+            if (strcmp(label, "LED") == 0) {
                 ei_printf(">>> EXECUTING: LED OFF <<<\n");
                 digitalWrite(LED_BUILTIN, LOW);
-                player.playSpecified(3);                        /* Play LED OFF sound */
                 current_state = STATE_WAIT_ACTION;
             } else if (strcmp(label, "FAN") == 0) {
                 ei_printf(">>> EXECUTING: FAN OFF <<<\n");
                 fan_control(false);
-                player.playSpecified(5);                        /* Play FAN OFF sound */
                 current_state = STATE_WAIT_ACTION;
             }
             break;
     }
+}
+
+/* ========== MEMORY USAGE REPORTING FUNCTION ========== */
+/**
+ * Prints current memory usage statistics (heap and stack)
+ * Uses mbed_stats to gather memory information
+ * Outputs to serial console
+ */
+void print_memory_usage() {
+    mbed_stats_heap_t heap_stats;
+    mbed_stats_heap_get(&heap_stats);
+
+    mbed_stats_stack_t stack_stats;
+    mbed_stats_stack_get(&stack_stats);
+    ei_printf("Memory Usage:\n");
+    ei_printf("Heap - Current: %lu bytes, Max: %lu bytes\n", heap_stats.current_size, heap_stats.max_size);
+    ei_printf("Stack - Max Used: %lu bytes\n", stack_stats.max_size);
+
+    ei_printf("Est. RAM Active: %lu bytes\n", heap_stats.current_size + stack_stats.max_size);
+    ei_printf("====================\n");
 }
 
 /* ========== HARDWARE CONTROL FUNCTIONS ========== */
